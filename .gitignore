@@ -1,0 +1,23 @@
+# Secrets — never commit
+.env
+.env.local
+*.pem
+keys/
+
+# Local data
+data/
+*.db
+*.db-journal
+*.parquet
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Editor
+.vscode/
+.idea/
+.DS_Store
