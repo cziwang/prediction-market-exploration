@@ -1,6 +1,6 @@
 """Fetch play-by-play data for all games in a season and store raw JSON in S3.
 
-Reads game IDs from the local games table, fetches PBP from the NBA API,
+Reads game IDs from the season games file in S3, fetches PBP from the NBA API,
 and stores one JSON file per game in S3.
 
 Usage (from repo root):
@@ -17,25 +17,14 @@ import argparse
 import time
 
 from app.clients.nba import fetch_play_by_play
-from app.db.session import get_db
-from app.services.s3_raw import put_raw, list_keys
+from app.services.s3_raw import get_raw, put_raw, list_keys
 
 
-def get_game_ids(season_id: str) -> list[str]:
-    """Get unique game IDs from the games table for a season."""
-    conn = get_db()
-    rows = conn.execute(
-        "SELECT DISTINCT game_id FROM games WHERE season_id = ? ORDER BY game_date",
-        (season_id,),
-    ).fetchall()
-    conn.close()
-    return [r[0] for r in rows]
-
-
-def season_to_season_id(season: str) -> str:
-    """Convert '2024-25' to '22024' (NBA season_id format)."""
-    year = season.split("-")[0]
-    return f"2{year}"
+def get_game_ids_from_s3(season: str) -> list[str]:
+    """Read game IDs from the season games file in S3."""
+    raw = get_raw(f"nba/games/season_{season}.json")
+    game_ids = sorted(set(row["GAME_ID"] for row in raw))
+    return game_ids
 
 
 def main() -> None:
@@ -48,12 +37,11 @@ def main() -> None:
                     help="Seconds between API calls (default: 0.6)")
     args = ap.parse_args()
 
-    season_id = season_to_season_id(args.season)
-    game_ids = get_game_ids(season_id)
-
-    if not game_ids:
-        print(f"No games found for season {args.season} (season_id={season_id}).")
-        print("Run `python -m scripts.fetch_nba_games` first.")
+    try:
+        game_ids = get_game_ids_from_s3(args.season)
+    except Exception as e:
+        print(f"Could not read game IDs from S3: {e}")
+        print("Run `python -m scripts.fetch_nba_games` first to populate S3.")
         return
 
     if args.max_games:
