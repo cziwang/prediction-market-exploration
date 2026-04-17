@@ -6,7 +6,7 @@ the ingest service layer.
 
 from __future__ import annotations
 
-from nba_api.stats.endpoints import leaguegamefinder
+from nba_api.stats.endpoints import leaguegamefinder, playbyplayv3
 
 
 def fetch_season_games(season: str) -> list[dict]:
@@ -24,4 +24,22 @@ def fetch_season_games(season: str) -> list[dict]:
         league_id_nullable="00",
     )
     df = gf.get_data_frames()[0]
+    return df.to_dict(orient="records")
+
+
+def fetch_play_by_play(game_id: str) -> list[dict]:
+    """Fetch play-by-play data for a single game.
+
+    Args:
+        game_id: 10-digit NBA game ID, e.g. "0022400001"
+
+    Returns:
+        List of raw row dicts from the PlayByPlayV3 endpoint.
+    """
+    pbp = playbyplayv3.PlayByPlayV3(
+        game_id=game_id,
+        start_period=1,
+        end_period=10,  # covers OT periods
+    )
+    df = pbp.get_data_frames()[0]
     return df.to_dict(orient="records")

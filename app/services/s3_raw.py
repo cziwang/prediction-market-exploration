@@ -50,8 +50,12 @@ def put_raw(source: str, dataset: str, key: str, data: object) -> str:
 def list_keys(source: str, dataset: str) -> list[str]:
     """List all keys under a source/dataset prefix."""
     prefix = f"{source}/{dataset}/"
-    resp = _get_client().list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
-    return [obj["Key"] for obj in resp.get("Contents", [])]
+    keys: list[str] = []
+    paginator = _get_client().get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            keys.append(obj["Key"])
+    return keys
 
 
 def get_raw(s3_key: str) -> object:
