@@ -12,15 +12,17 @@ Output: ./data/kalshi_nba.db
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import sqlite3
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import requests
+from kalshi_python.api.markets_api import MarketsApi
+from kalshi_python.exceptions import ApiException
 
-from kalshi_client import KalshiClient
+from kalshi_client import make_client, paginate_markets
 
 SERIES = "KXNBAGAME"
 ROOT = Path(__file__).resolve().parent
@@ -84,68 +86,72 @@ def init_db() -> sqlite3.Connection:
     return conn
 
 
-def upsert_markets(conn: sqlite3.Connection, client: KalshiClient) -> int:
-    """Pull from both /historical/markets and /markets?status=settled and dedupe."""
+def upsert_markets(
+    conn: sqlite3.Connection, api: MarketsApi, max_markets: int | None = None
+) -> int:
+    """Pull settled NBA markets from the SDK's get_markets endpoint."""
+    prefix = f"{SERIES}-"
     seen: set[str] = set()
     total = 0
-    sources = [
-        ("/historical/markets", {"series_ticker": SERIES, "limit": 1000}),
-        ("/markets", {"series_ticker": SERIES, "status": "settled", "limit": 1000}),
-    ]
-    for path, params in sources:
-        print(f"  → {path} {params}")
-        page_count = 0
-        for m in client.paginate(path, params, "markets"):
-            t = m.get("ticker")
-            if not t or t in seen:
-                continue
-            seen.add(t)
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO markets
-                (ticker, event_ticker, series_ticker, title, yes_sub_title,
-                 no_sub_title, open_time, close_time, status, result, volume, raw_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    t,
-                    m.get("event_ticker"),
-                    SERIES,
-                    m.get("title"),
-                    m.get("yes_sub_title"),
-                    m.get("no_sub_title"),
-                    m.get("open_time"),
-                    m.get("close_time"),
-                    m.get("status"),
-                    m.get("result"),
-                    m.get("volume"),
-                    json.dumps(m),
-                ),
-            )
-            total += 1
-            page_count += 1
-            if page_count % 500 == 0:
-                conn.commit()
-                print(f"    upserted {page_count} so far…")
-        conn.commit()
+
+    print(f"  → get_markets(series_ticker={SERIES}, status=settled)")
+    page_count = 0
+    for m in paginate_markets(api, series_ticker=SERIES, status="settled", limit=1000):
+        if max_markets is not None and len(seen) >= max_markets:
+            break
+        t = m.ticker
+        if not t or t in seen or not t.startswith(prefix):
+            continue
+        seen.add(t)
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO markets
+            (ticker, event_ticker, series_ticker, title, yes_sub_title,
+             no_sub_title, open_time, close_time, status, result, volume, raw_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                t,
+                m.event_ticker,
+                SERIES,
+                m.title,
+                m.subtitle,
+                None,
+                m.open_time,
+                m.close_time,
+                m.status,
+                m.result,
+                m.volume,
+                json.dumps(m.to_dict()),
+            ),
+        )
+        total += 1
+        page_count += 1
+        if page_count % 500 == 0:
+            conn.commit()
+            print(f"    upserted {page_count} so far…")
+    conn.commit()
     return total
 
 
 def fetch_candlesticks(
     conn: sqlite3.Connection,
-    client: KalshiClient,
+    api: MarketsApi,
     period_interval: int,
     skip_existing: bool,
     throttle_s: float,
+    max_markets: int | None = None,
 ) -> None:
+    limit_clause = f"LIMIT {int(max_markets)}" if max_markets is not None else ""
     rows = conn.execute(
-        """
+        f"""
         SELECT ticker, open_time, close_time
         FROM markets
-        WHERE status = 'settled'
+        WHERE result IS NOT NULL AND result != ''
           AND open_time IS NOT NULL
           AND close_time IS NOT NULL
         ORDER BY close_time DESC
+        {limit_clause}
         """
     ).fetchall()
 
@@ -167,26 +173,19 @@ def fetch_candlesticks(
             continue
 
         try:
-            data = client.get(
-                f"/series/{SERIES}/markets/{ticker}/candlesticks",
-                {
-                    "start_ts": start_ts,
-                    "end_ts": end_ts,
-                    "period_interval": period_interval,
-                },
+            resp = api.get_market_candlesticks(
+                ticker=SERIES,
+                market_ticker=ticker,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                period_interval=period_interval,
             )
-        except requests.HTTPError as e:
-            print(f"  [{i}/{n}] {ticker}: HTTP {e.response.status_code if e.response else '?'}")
-            continue
-        except requests.RequestException as e:
-            print(f"  [{i}/{n}] {ticker}: {e}")
+        except ApiException as e:
+            print(f"  [{i}/{n}] {ticker}: API error {e.status}")
             continue
 
-        candles = data.get("candlesticks", []) or []
+        candles = resp.candlesticks or []
         for c in candles:
-            price = c.get("price") or {}
-            yes_bid = c.get("yes_bid") or {}
-            yes_ask = c.get("yes_ask") or {}
             conn.execute(
                 """
                 INSERT OR REPLACE INTO candlesticks
@@ -196,15 +195,15 @@ def fetch_candlesticks(
                 """,
                 (
                     ticker,
-                    c.get("end_period_ts"),
-                    price.get("open"),
-                    price.get("high"),
-                    price.get("low"),
-                    price.get("close"),
-                    c.get("volume", c.get("volume_fp")),
-                    c.get("open_interest", c.get("open_interest_fp")),
-                    yes_bid.get("close"),
-                    yes_ask.get("close"),
+                    c.end_ts,
+                    c.open,
+                    c.high,
+                    c.low,
+                    c.close,
+                    c.volume,
+                    None,
+                    None,
+                    None,
                 ),
             )
         conn.execute(
@@ -225,17 +224,38 @@ def fetch_candlesticks(
             time.sleep(throttle_s)
 
 
+def export_csv(conn: sqlite3.Connection) -> None:
+    """Dump the markets and candlesticks tables to CSV alongside the SQLite DB."""
+    # Skip raw_json in CSV — it's a huge blob per row. Keep it in the DB.
+    exclude = {"markets": {"raw_json"}, "candlesticks": set()}
+    for table, skip in exclude.items():
+        cur = conn.execute(f"SELECT * FROM {table}")
+        cols = [d[0] for d in cur.description]
+        keep = [i for i, c in enumerate(cols) if c not in skip]
+        out_cols = [cols[i] for i in keep]
+        path = DATA_DIR / f"{table}.csv"
+        rows_written = 0
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(out_cols)
+            for row in cur:
+                w.writerow([row[i] for i in keep])
+                rows_written += 1
+        print(f"  wrote {rows_written:>6} rows → {path}")
+
+
 def summarize(conn: sqlite3.Connection) -> None:
     m_total = conn.execute("SELECT COUNT(*) FROM markets").fetchone()[0]
     m_settled = conn.execute(
-        "SELECT COUNT(*) FROM markets WHERE status = 'settled'"
+        "SELECT COUNT(*) FROM markets WHERE result IS NOT NULL AND result != ''"
     ).fetchone()[0]
     c_total = conn.execute("SELECT COUNT(*) FROM candlesticks").fetchone()[0]
     c_tickers = conn.execute(
         "SELECT COUNT(DISTINCT ticker) FROM candlesticks"
     ).fetchone()[0]
     date_range = conn.execute(
-        "SELECT MIN(close_time), MAX(close_time) FROM markets WHERE status = 'settled'"
+        "SELECT MIN(close_time), MAX(close_time) FROM markets "
+        "WHERE result IS NOT NULL AND result != ''"
     ).fetchone()
     print()
     print(f"Markets:      {m_total} total, {m_settled} settled")
@@ -275,27 +295,49 @@ def main() -> None:
         action="store_true",
         help="Skip refreshing market metadata (only fetch candles)",
     )
+    ap.add_argument(
+        "--csv",
+        action="store_true",
+        help="After fetching, export markets and candlesticks tables to CSV",
+    )
+    ap.add_argument(
+        "--csv-only",
+        action="store_true",
+        help="Skip any API calls; just export existing DB tables to CSV",
+    )
+    ap.add_argument(
+        "--max-markets",
+        type=int,
+        default=None,
+        help="Cap markets fetched (for quick tests). Default: unlimited",
+    )
     args = ap.parse_args()
-
-    client = KalshiClient()
-    print(f"Kalshi client authenticated: {client.authenticated}")
 
     conn = init_db()
 
-    if not args.skip_markets:
-        print(f"\nFetching markets for series {SERIES}…")
-        n = upsert_markets(conn, client)
-        print(f"  upserted {n} unique markets")
+    if not args.csv_only:
+        api = make_client()
+        print("Kalshi SDK client ready")
 
-    if args.candles:
-        print(f"\nFetching {args.period}-minute candlesticks…")
-        fetch_candlesticks(
-            conn,
-            client,
-            period_interval=args.period,
-            skip_existing=not args.refresh_candles,
-            throttle_s=args.throttle,
-        )
+        if not args.skip_markets:
+            print(f"\nFetching markets for series {SERIES}…")
+            n = upsert_markets(conn, api, max_markets=args.max_markets)
+            print(f"  upserted {n} unique markets")
+
+        if args.candles:
+            print(f"\nFetching {args.period}-minute candlesticks…")
+            fetch_candlesticks(
+                conn,
+                api,
+                period_interval=args.period,
+                skip_existing=not args.refresh_candles,
+                throttle_s=args.throttle,
+                max_markets=args.max_markets,
+            )
+
+    if args.csv or args.csv_only:
+        print("\nExporting CSV…")
+        export_csv(conn)
 
     summarize(conn)
 

@@ -17,53 +17,77 @@ fetch_nba_history.py    # CLI entry point
 requirements.txt
 ```
 
-## Setup
+## Setup (one-time)
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
+# 1. Create a virtualenv and install deps
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
-```
 
-Create a `.env` at the repo root:
-
-```
-KALSHI_API_KEY_ID=<your key id>
-KALSHI_PRIVATE_KEY_PATH=./keys/kalshi-private-key.pem
-```
-
-Generate the key pair at <https://kalshi.com/account/profile> → API Keys.
-Download the PEM and drop it at `./keys/kalshi-private-key.pem`
-(or point `KALSHI_PRIVATE_KEY_PATH` elsewhere). Lock it down:
-
-```bash
+# 2. (Optional) Add Kalshi API keys for higher rate limits
+#    Generate at https://kalshi.com/account/profile → API Keys
+#    You'll download a PEM private key and get a Key ID.
+mkdir -p keys
+mv ~/Downloads/kalshi-*.pem keys/kalshi-private-key.pem
 chmod 600 keys/kalshi-private-key.pem
+
+# 3. Create .env with your Key ID (file is gitignored)
+cat > .env <<EOF
+KALSHI_API_KEY_ID=<paste your key id here>
+KALSHI_PRIVATE_KEY_PATH=./keys/kalshi-private-key.pem
+EOF
 ```
 
-The script runs without keys too — the historical endpoints are public. You
-just get tighter rate limits.
+The script also works with **no keys** — the public market endpoints are
+unauthenticated. Just skip step 2–3.
 
-## Usage
+## Running
 
 ```bash
-# Market metadata only (fast — one paginated list call)
-python fetch_nba_history.py
+# Always activate the venv first
+source .venv/bin/activate
 
-# + per-minute OHLC price history for every settled game (slow — one call per market)
-python fetch_nba_history.py --candles
+# --- Quick test run (recommended first) ---
+# Pull 5 markets + their 1-minute candlesticks, dump to CSV
+python fetch_nba_history.py --candles --csv --max-markets 5
 
-# Coarser resolution
-python fetch_nba_history.py --candles --period 60     # hourly
-python fetch_nba_history.py --candles --period 1440   # daily
+# --- Full pull ---
+# All settled NBA games, metadata only (fast)
+python fetch_nba_history.py --csv
 
-# Re-fetch candles already in the DB
-python fetch_nba_history.py --candles --refresh-candles
+# All settled NBA games + per-minute OHLC (slow — one API call per market)
+python fetch_nba_history.py --candles --csv
 
-# Skip market refresh, only fetch missing candles
-python fetch_nba_history.py --candles --skip-markets
+# Coarser candlestick resolution to cut request count
+python fetch_nba_history.py --candles --csv --period 60     # hourly
+python fetch_nba_history.py --candles --csv --period 1440   # daily
+
+# Re-export CSV from an existing DB (no API calls)
+python fetch_nba_history.py --csv-only
 ```
 
-Output lives at `data/kalshi_nba.db`. Re-runs are resumeable — the `fetch_log`
-table tracks which tickers already have candles for a given period.
+### All flags
+
+| flag | purpose |
+|---|---|
+| `--candles` | also fetch OHLC candlesticks for each settled market |
+| `--period {1,60,1440}` | candlestick interval in minutes (default: 1) |
+| `--csv` | after fetching, dump `markets.csv` + `candlesticks.csv` to `data/` |
+| `--csv-only` | skip API calls, just re-export existing DB to CSV |
+| `--max-markets N` | cap markets fetched (useful for smoke-tests) |
+| `--refresh-candles` | re-fetch candles already stored for the given period |
+| `--skip-markets` | skip metadata refresh, only fetch missing candles |
+| `--throttle SECS` | sleep between candlestick calls (default: 0.1s) |
+
+### Outputs
+
+- `data/kalshi_nba.db` — SQLite, source of truth, re-runs are resumeable
+- `data/markets.csv` — one row per market (minus the raw JSON blob)
+- `data/candlesticks.csv` — one row per OHLC bucket
+
+Resume behavior: the `fetch_log` table tracks which `(ticker, period)` pairs
+already have candles. Re-running skips them unless `--refresh-candles` is set.
 
 ## Schema
 
@@ -78,7 +102,7 @@ Each NBA game has two markets (one per team) sharing an `event_ticker`.
 | `series_ticker` | TEXT | always `KXNBAGAME` here |
 | `title` / `yes_sub_title` / `no_sub_title` | TEXT | human-readable |
 | `open_time` / `close_time` | TEXT (ISO) | market lifecycle |
-| `status` | TEXT | `settled`, `open`, etc. |
+| `status` | TEXT | `finalized`, `open`, `settled`, etc. |
 | `result` | TEXT | `yes` / `no` — which side won |
 | `volume` | INTEGER | lifetime contract volume |
 | `raw_json` | TEXT | full API payload for fields not otherwise extracted |

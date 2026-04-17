@@ -1,3 +1,4 @@
-requests>=2.32
+kalshi-python>=2.1
 python-dotenv>=1.0
-cryptography>=42.0
+fastapi>=0.115
+uvicorn>=0.30
