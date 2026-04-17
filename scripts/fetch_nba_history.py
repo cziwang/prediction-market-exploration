@@ -1,10 +1,10 @@
 """Fetch settled NBA game markets from Kalshi and store them in SQLite.
 
-Usage:
-    python fetch_nba_history.py                 # markets only
-    python fetch_nba_history.py --candles       # + 1-minute OHLC per market
-    python fetch_nba_history.py --candles --period 60
-    python fetch_nba_history.py --candles --refresh-candles
+Usage (from repo root):
+    python -m scripts.fetch_nba_history                 # markets only
+    python -m scripts.fetch_nba_history --candles       # + 1-minute OHLC per market
+    python -m scripts.fetch_nba_history --candles --period 60
+    python -m scripts.fetch_nba_history --candles --refresh-candles
 
 Output: ./data/kalshi_nba.db
 """
@@ -17,57 +17,13 @@ import json
 import sqlite3
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 
 from kalshi_python.api.markets_api import MarketsApi
 from kalshi_python.exceptions import ApiException
 
-from kalshi_client import make_client, paginate_markets
-
-SERIES = "KXNBAGAME"
-ROOT = Path(__file__).resolve().parent
-DATA_DIR = ROOT / "data"
-DB_PATH = DATA_DIR / "kalshi_nba.db"
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS markets (
-    ticker         TEXT PRIMARY KEY,
-    event_ticker   TEXT,
-    series_ticker  TEXT,
-    title          TEXT,
-    yes_sub_title  TEXT,
-    no_sub_title   TEXT,
-    open_time      TEXT,
-    close_time     TEXT,
-    status         TEXT,
-    result         TEXT,
-    volume         INTEGER,
-    raw_json       TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_markets_event ON markets(event_ticker);
-CREATE INDEX IF NOT EXISTS idx_markets_close ON markets(close_time);
-
-CREATE TABLE IF NOT EXISTS candlesticks (
-    ticker           TEXT,
-    end_period_ts    INTEGER,
-    price_open       REAL,
-    price_high       REAL,
-    price_low        REAL,
-    price_close      REAL,
-    volume           INTEGER,
-    open_interest    INTEGER,
-    yes_bid_close    REAL,
-    yes_ask_close    REAL,
-    PRIMARY KEY (ticker, end_period_ts)
-);
-
-CREATE TABLE IF NOT EXISTS fetch_log (
-    ticker       TEXT PRIMARY KEY,
-    fetched_at   TEXT,
-    candle_count INTEGER,
-    period_min   INTEGER
-);
-"""
+from app.clients.kalshi import make_client, paginate_markets
+from app.core.config import DATA_DIR, DB_PATH, SERIES
+from app.db.session import init_db
 
 
 def iso_to_ts(s: str | None) -> int | None:
@@ -79,22 +35,14 @@ def iso_to_ts(s: str | None) -> int | None:
         return None
 
 
-def init_db() -> sqlite3.Connection:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.executescript(SCHEMA)
-    return conn
-
-
 def upsert_markets(
     conn: sqlite3.Connection, api: MarketsApi, max_markets: int | None = None
 ) -> int:
-    """Pull settled NBA markets from the SDK's get_markets endpoint."""
     prefix = f"{SERIES}-"
     seen: set[str] = set()
     total = 0
 
-    print(f"  → get_markets(series_ticker={SERIES}, status=settled)")
+    print(f"  -> get_markets(series_ticker={SERIES}, status=settled)")
     page_count = 0
     for m in paginate_markets(api, series_ticker=SERIES, status="settled", limit=1000):
         if max_markets is not None and len(seen) >= max_markets:
@@ -129,7 +77,7 @@ def upsert_markets(
         page_count += 1
         if page_count % 500 == 0:
             conn.commit()
-            print(f"    upserted {page_count} so far…")
+            print(f"    upserted {page_count} so far...")
     conn.commit()
     return total
 
@@ -225,8 +173,6 @@ def fetch_candlesticks(
 
 
 def export_csv(conn: sqlite3.Connection) -> None:
-    """Dump the markets and candlesticks tables to CSV alongside the SQLite DB."""
-    # Skip raw_json in CSV — it's a huge blob per row. Keep it in the DB.
     exclude = {"markets": {"raw_json"}, "candlesticks": set()}
     for table, skip in exclude.items():
         cur = conn.execute(f"SELECT * FROM {table}")
@@ -241,7 +187,7 @@ def export_csv(conn: sqlite3.Connection) -> None:
             for row in cur:
                 w.writerow([row[i] for i in keep])
                 rows_written += 1
-        print(f"  wrote {rows_written:>6} rows → {path}")
+        print(f"  wrote {rows_written:>6} rows -> {path}")
 
 
 def summarize(conn: sqlite3.Connection) -> None:
@@ -261,56 +207,28 @@ def summarize(conn: sqlite3.Connection) -> None:
     print(f"Markets:      {m_total} total, {m_settled} settled")
     print(f"Candles:      {c_total} rows across {c_tickers} markets")
     if date_range[0]:
-        print(f"Date range:   {date_range[0]} → {date_range[1]}")
+        print(f"Date range:   {date_range[0]} -> {date_range[1]}")
     print(f"DB:           {DB_PATH}")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument(
-        "--candles",
-        action="store_true",
-        help="Also fetch OHLC candlesticks for each settled market",
-    )
-    ap.add_argument(
-        "--period",
-        type=int,
-        default=1,
-        choices=[1, 60, 1440],
-        help="Candlestick interval in minutes (default: 1)",
-    )
-    ap.add_argument(
-        "--refresh-candles",
-        action="store_true",
-        help="Re-fetch candlesticks even if already stored for this period",
-    )
-    ap.add_argument(
-        "--throttle",
-        type=float,
-        default=0.1,
-        help="Seconds to sleep between candlestick requests (default: 0.1)",
-    )
-    ap.add_argument(
-        "--skip-markets",
-        action="store_true",
-        help="Skip refreshing market metadata (only fetch candles)",
-    )
-    ap.add_argument(
-        "--csv",
-        action="store_true",
-        help="After fetching, export markets and candlesticks tables to CSV",
-    )
-    ap.add_argument(
-        "--csv-only",
-        action="store_true",
-        help="Skip any API calls; just export existing DB tables to CSV",
-    )
-    ap.add_argument(
-        "--max-markets",
-        type=int,
-        default=None,
-        help="Cap markets fetched (for quick tests). Default: unlimited",
-    )
+    ap.add_argument("--candles", action="store_true",
+                    help="Also fetch OHLC candlesticks for each settled market")
+    ap.add_argument("--period", type=int, default=1, choices=[1, 60, 1440],
+                    help="Candlestick interval in minutes (default: 1)")
+    ap.add_argument("--refresh-candles", action="store_true",
+                    help="Re-fetch candlesticks even if already stored for this period")
+    ap.add_argument("--throttle", type=float, default=0.1,
+                    help="Seconds to sleep between candlestick requests (default: 0.1)")
+    ap.add_argument("--skip-markets", action="store_true",
+                    help="Skip refreshing market metadata (only fetch candles)")
+    ap.add_argument("--csv", action="store_true",
+                    help="After fetching, export markets and candlesticks tables to CSV")
+    ap.add_argument("--csv-only", action="store_true",
+                    help="Skip any API calls; just export existing DB tables to CSV")
+    ap.add_argument("--max-markets", type=int, default=None,
+                    help="Cap markets fetched (for quick tests). Default: unlimited")
     args = ap.parse_args()
 
     conn = init_db()
@@ -320,12 +238,12 @@ def main() -> None:
         print("Kalshi SDK client ready")
 
         if not args.skip_markets:
-            print(f"\nFetching markets for series {SERIES}…")
+            print(f"\nFetching markets for series {SERIES}...")
             n = upsert_markets(conn, api, max_markets=args.max_markets)
             print(f"  upserted {n} unique markets")
 
         if args.candles:
-            print(f"\nFetching {args.period}-minute candlesticks…")
+            print(f"\nFetching {args.period}-minute candlesticks...")
             fetch_candlesticks(
                 conn,
                 api,
@@ -336,7 +254,7 @@ def main() -> None:
             )
 
     if args.csv or args.csv_only:
-        print("\nExporting CSV…")
+        print("\nExporting CSV...")
         export_csv(conn)
 
     summarize(conn)

@@ -1,7 +1,7 @@
 """Python client for the NBA Prediction Market API.
 
 Usage:
-    from nba_client import NBAClient
+    from app.clients.nba import NBAClient
 
     client = NBAClient()                          # default: http://127.0.0.1:8000
     client = NBAClient("http://localhost:9000")    # custom base URL
@@ -29,7 +29,7 @@ class NBAClient:
         resp.raise_for_status()
         return resp.json()
 
-    # ── Markets ──────────────────────────────────────────────────────────────
+    # -- Markets --
 
     def list_markets(
         self,
@@ -43,7 +43,6 @@ class NBAClient:
         limit: int = 100,
         offset: int = 0,
     ) -> dict[str, Any]:
-        """List markets with optional filters, sorting, and pagination."""
         params: dict[str, Any] = {"sort": sort, "order": order, "limit": limit, "offset": offset}
         if status:
             params["status"] = status
@@ -56,25 +55,17 @@ class NBAClient:
         return self._get("/markets", params)
 
     def get_market(self, ticker: str) -> dict[str, Any]:
-        """Get a single market by ticker."""
         return self._get(f"/markets/{ticker}")
 
-    # ── Events ───────────────────────────────────────────────────────────────
+    # -- Events --
 
-    def list_events(
-        self,
-        *,
-        limit: int = 100,
-        offset: int = 0,
-    ) -> dict[str, Any]:
-        """List events (each NBA game = one event with two side-markets)."""
+    def list_events(self, *, limit: int = 100, offset: int = 0) -> dict[str, Any]:
         return self._get("/events", {"limit": limit, "offset": offset})
 
     def get_event(self, event_ticker: str) -> dict[str, Any]:
-        """Get all markets for a single event."""
         return self._get(f"/events/{event_ticker}")
 
-    # ── Candlesticks ─────────────────────────────────────────────────────────
+    # -- Candlesticks --
 
     def get_candlesticks(
         self,
@@ -84,7 +75,6 @@ class NBAClient:
         end_ts: int | None = None,
         limit: int = 5000,
     ) -> dict[str, Any]:
-        """Get OHLC candlestick data for a market."""
         params: dict[str, Any] = {"limit": limit}
         if start_ts is not None:
             params["start_ts"] = start_ts
@@ -92,20 +82,16 @@ class NBAClient:
             params["end_ts"] = end_ts
         return self._get(f"/markets/{ticker}/candlesticks", params)
 
-    # ── Analytics ────────────────────────────────────────────────────────────
+    # -- Analytics --
 
     def summary(self) -> dict[str, Any]:
-        """High-level summary stats for the dataset."""
         return self._get("/analytics/summary")
 
     def biggest_swings(self, *, limit: int = 20) -> dict[str, Any]:
-        """Markets with the largest intra-game price swings."""
         return self._get("/analytics/biggest-swings", {"limit": limit})
 
     def volume_leaders(self, *, limit: int = 20) -> dict[str, Any]:
-        """Markets ranked by trading volume."""
         return self._get("/analytics/volume-leaders", {"limit": limit})
 
     def result_distribution(self) -> dict[str, Any]:
-        """Yes vs no outcome counts across all settled markets."""
         return self._get("/analytics/result-distribution")
