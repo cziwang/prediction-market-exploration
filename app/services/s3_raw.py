@@ -58,7 +58,7 @@ def list_keys(source: str, dataset: str) -> list[str]:
     return keys
 
 
-def get_raw(s3_key: str) -> object:
+def get_raw(s3_key: str) -> list | dict:
     """Read and parse a JSON object from S3."""
     resp = _get_client().get_object(Bucket=S3_BUCKET, Key=s3_key)
     return json.loads(resp["Body"].read())
