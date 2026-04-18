@@ -13,7 +13,7 @@ one S3 prefix per server-side message `type`
 ## Prerequisites
 
 Assumes the EC2 instance is already set up per
-[`live-pbp-ingestion.md`](live-pbp-ingestion.md) (Python 3.12 venv,
+[`ec2-bootstrap.md`](ec2-bootstrap.md) (Python 3.12 venv,
 `requirements.txt` installed, IAM role with S3 access attached).
 
 Unlike the NBA service, **this one needs Kalshi credentials on disk** —

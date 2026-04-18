@@ -1,19 +1,21 @@
-# Running `scripts/live/nba_cdn.py` as a systemd service
+# Running `scripts/live/nba_cdn` as a systemd service
 
-This is the deployment guide for the **new** bronze-writing NBA ingester
-(`scripts/live/nba_cdn.py`). Design lives in [`data-flow.md`](data-flow.md);
-the older on-disk-JSONL poller (`scripts/nba_cdn/poll_live.py`) has its own
-guide in [`live-pbp-ingestion.md`](live-pbp-ingestion.md).
+Deployment guide for the bronze-writing NBA CDN ingester at
+`scripts/live/nba_cdn/`. Design lives in [`data-flow.md`](data-flow.md);
+EC2 prerequisites in [`ec2-bootstrap.md`](ec2-bootstrap.md). The older
+per-game-JSONL poller at `scripts/nba_cdn/poll_live.py` is deprecated —
+left in the tree as a fallback with no active service backing it.
 
-The new service writes directly to `s3://prediction-markets-data/bronze/nba_cdn/`
-via `BronzeWriter` — no local files, continuous flushes every ~60 s.
+The service writes directly to
+`s3://prediction-markets-data/bronze/nba_cdn/` via `BronzeWriter` — no
+local files, continuous flushes every ~60 s.
 
 ## Prerequisites
 
-Assumes the EC2 instance is already set up per `live-pbp-ingestion.md`
-(Python 3.12 venv, `requirements.txt` installed, IAM role with S3 access
-attached). If not, follow that doc's "Instance setup" and "Bootstrap"
-sections first.
+Assumes the EC2 instance is already set up per
+[`ec2-bootstrap.md`](ec2-bootstrap.md) (Python 3.12 venv,
+`requirements.txt` installed, IAM role with S3 access attached). If
+not, follow that doc first.
 
 On the instance, pull latest code:
 
