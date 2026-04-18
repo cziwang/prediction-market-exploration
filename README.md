@@ -4,6 +4,10 @@ Collecting NBA game data and Kalshi prediction market data for analysis and back
 
 ## Architecture
 
+Two parallel tracks running against the same S3 bucket.
+
+**Batch fetchers** — one-shot historical pulls:
+
 ```
          Data Sources                          Storage
     ┌───────────────────┐
@@ -12,7 +16,7 @@ Collecting NBA game data and Kalshi prediction market data for analysis and back
     └───────────────────┘  │
     ┌───────────────────┐  │   ┌──────────────────────┐
     │  cdn.nba.com      │──┼──>│  S3 (raw JSON)       │
-    │  (REST)           │  │   │  prediction-markets-  │
+    │  (REST)           │  │   │  prediction-markets- │
     └───────────────────┘  │   │  data bucket          │
     ┌───────────────────┐  │   └──────────────────────┘
     │  Kalshi API       │──┘
@@ -20,11 +24,27 @@ Collecting NBA game data and Kalshi prediction market data for analysis and back
     └───────────────────┘
 ```
 
+**Live streaming** (in progress) — long-running process per source, fans each raw frame four ways in-process:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Live process (one per source)                              │
+│    ingester (WS / REST poll)                                │
+│         │                                                   │
+│         ├──▶ BronzeWriter  ──▶ s3://…/bronze/ (gzip JSONL)  │
+│         ▼                                                   │
+│    transform() ──▶ strategy.on_event() (in-process)         │
+│         │                                                   │
+│         └──▶ SilverWriter  ──▶ s3://…/silver/ (Parquet)     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+The key property: `transform()` runs exactly once per event, and its output is simultaneously what the strategy sees live and what silver stores for backtests. Structural parity. Full design in [`docs/data-flow.md`](docs/data-flow.md).
+
 ### Data flow
 
-1. **Fetch** — clients call external APIs and return raw responses
-2. **Store raw** — raw JSON is written to S3 with deterministic keys (same call twice overwrites, no duplicates)
-3. All scripts are idempotent — safe to re-run, they skip existing data
+1. **Batch fetchers** — clients call external APIs, raw JSON written to S3 with deterministic keys (idempotent; re-runs skip existing data).
+2. **Live streaming** — per-source process ingests raw frames, writes gzipped JSONL to `bronze/`, runs `transform()` inline, feeds the strategy, and serializes typed events to Parquet under `silver/`. Bronze is authoritative; silver is rebuildable.
 
 ### Data sources
 
@@ -39,21 +59,25 @@ Collecting NBA game data and Kalshi prediction market data for analysis and back
 
 ```
 s3://prediction-markets-data/
-├── nba/                        # stats.nba.com
+├── nba/                        # stats.nba.com (batch)
 │   ├── games/
 │   └── play_by_play/
-├── nba_cdn/                    # cdn.nba.com
+├── nba_cdn/                    # cdn.nba.com (batch)
 │   ├── scoreboard/
 │   ├── odds/
 │   ├── boxscore/
 │   └── play_by_play/
-└── kalshi/                     # Kalshi REST API
-    ├── historical_markets/
-    ├── historical_trades/
-    └── historical_candlesticks/
-        ├── 1m/
-        ├── 60m/
-        └── 1440m/
+├── kalshi/                     # Kalshi REST API (batch)
+│   ├── historical_markets/
+│   ├── historical_trades/
+│   └── historical_candlesticks/
+│       ├── 1m/
+│       ├── 60m/
+│       └── 1440m/
+├── bronze/                     # Live raw frames (gzip JSONL)
+│   └── {source}/{channel}/YYYY/MM/DD/HH/{uuid}.jsonl.gz
+└── silver/                     # Live typed events (Parquet)
+    └── {source}/{EventType}/date=YYYY-MM-DD/v=N/part-{uuid}.parquet
 ```
 
 ## Setup
@@ -90,6 +114,9 @@ python -m scripts.nba_cdn.fetch_play_by_play
 python -m scripts.kalshi.fetch_historical_markets              # all NBA series (run first)
 python -m scripts.kalshi.fetch_historical_trades --workers 4
 python -m scripts.kalshi.fetch_historical_candlesticks --workers 4 --interval 60
+
+# --- Live streaming ---
+python -m scripts.infra.smoke_test                             # end-to-end test of BronzeWriter + SilverWriter
 ```
 
 ## Kalshi NBA series
