@@ -1,4 +1,14 @@
-"""Live play-by-play poller for NBA games.
+"""Live play-by-play poller for NBA games. [DEPRECATED]
+
+.. warning::
+   This script is superseded by ``scripts/live/nba_cdn`` (see
+   ``docs/live-nba-cdn-service.md``). The new ingester writes to
+   ``s3://prediction-markets-data/bronze/nba_cdn/`` continuously via
+   ``BronzeWriter`` instead of buffering to local JSONL and
+   uploading on ``gameStatus=3``. Left in the tree for git history
+   and as a fallback, but the ``nba-poller`` systemd service should
+   be stopped and disabled. New work should not depend on this
+   module's S3 layout (``nba_cdn/live_pbp/{game_id}.jsonl.gz``).
 
 Runs continuously. Discovers active games via the scoreboard, polls PBP
 every few seconds, and appends timestamped actions to local JSONL files.
