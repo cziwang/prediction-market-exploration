@@ -16,7 +16,7 @@ from __future__ import annotations
 import argparse
 import time
 
-from app.clients.nba import fetch_play_by_play
+from app.clients.nba_stats import fetch_play_by_play
 from app.services.s3_raw import get_raw, put_raw, list_keys
 
 

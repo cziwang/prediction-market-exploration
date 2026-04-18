@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import argparse
 
-from app.clients.nba import fetch_season_games
+from app.clients.nba_stats import fetch_season_games
 from app.services.s3_raw import put_raw
 
 
