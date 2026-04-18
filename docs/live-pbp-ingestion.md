@@ -212,7 +212,7 @@ New:
 
 - **Instance type:** `t4g.micro` (~$3/mo with free tier, ~$8/mo without). ARM — cheap and sufficient.
 - **Region:** `us-east-1`. NBA CDN is served via CloudFront; east-coast AWS gets 10-30ms RTT.
-- **AMI:** Amazon Linux 2023 ARM or Ubuntu 24.04 ARM. Either works — pick whichever you prefer.
+- **AMI:** Ubuntu 24.04 ARM.
 - **Storage:** 8GB gp3 (default). JSONL files are small and get deleted after S3 upload.
 - **Security group:** SSH inbound only. No HTTP needed.
 - **IAM instance profile:** Attach a role with `s3:PutObject` on `arn:aws:s3:::prediction-markets-data/*`. This avoids storing AWS credentials on the instance.
@@ -220,18 +220,15 @@ New:
 ### Bootstrap
 
 ```bash
-ssh -i your-key.pem ec2-user@<instance-ip>   # or ubuntu@ for Ubuntu AMI
+ssh -i ~/.ssh/ec2-prediction-market.pem ubuntu@<instance-ip>
 
-# System deps (Amazon Linux 2023)
-sudo dnf install -y python3.13 git
-
-# System deps (Ubuntu 24.04)
-# sudo apt update && sudo apt install -y python3.13 python3.13-venv git
+# System deps
+sudo apt update && sudo apt install -y python3.12-venv git
 
 # Clone and install
 git clone <your-repo-url> ~/prediction-market-exploration
 cd ~/prediction-market-exploration
-python3.13 -m venv .venv
+python3.12 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
 # Smoke test
@@ -249,9 +246,9 @@ After=network.target
 
 [Service]
 Type=simple
-User=ec2-user
-WorkingDirectory=/home/ec2-user/prediction-market-exploration
-ExecStart=/home/ec2-user/prediction-market-exploration/.venv/bin/python -m scripts.nba_cdn.poll_live
+User=ubuntu
+WorkingDirectory=/home/ubuntu/prediction-market-exploration
+ExecStart=/home/ubuntu/prediction-market-exploration/.venv/bin/python -m scripts.nba_cdn.poll_live
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -265,8 +262,6 @@ sudo systemctl daemon-reload
 sudo systemctl enable nba-poller   # start on boot
 sudo systemctl start nba-poller    # start now
 ```
-
-Adjust `User` and paths if using Ubuntu (`ubuntu` instead of `ec2-user`).
 
 ### Operations
 
