@@ -138,9 +138,7 @@ Key properties:
 
 ### NBA CDN polling
 
-Same shape, different ingester: `async for frame in nba_cdn.poll_live()` where the client yields one dict per poll tick per game. Transform is stateless (`parse_action`). Same bronze and silver writers, with `source="nba_cdn"`.
-
-The existing `scripts/nba_cdn/poll_live.py` (per-game local JSONL → gzip upload on `gameStatus=3`) is transitional. Migration to this design replaces it with `scripts/live/nba_cdn.py` and changes the bronze layout; notebooks that depend on the old layout need updating. Defer until the Kalshi path is working end-to-end.
+Same shape, different ingester. `scripts/live/nba_cdn/` discovers active games via `todaysScoreboard_00.json`, polls each live game's PBP and boxscore on a 3 s cadence, and emits every new action plus every non-304 scoreboard/odds/boxscore response to bronze under `source="nba_cdn"`. Transform is stateless (`parse_action`); same bronze and silver writers as Kalshi.
 
 ## Bronze storage
 

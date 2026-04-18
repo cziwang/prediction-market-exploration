@@ -135,7 +135,7 @@ As a service on EC2: see
 
 - **No on-disk resume.** Crash window is whatever's in memory — up to
   60 s or 5 MB of records per channel. See `docs/data-flow.md` for the
-  accepted tradeoff vs. the old `scripts/nba_cdn/poll_live.py`.
+  accepted tradeoff.
 - **No correction detection.** The old poller wrote periodic snapshot
   records with action hashes to detect retroactive NBA edits. Not yet
   ported; deferred per `docs/data-flow.md` open question #6.
