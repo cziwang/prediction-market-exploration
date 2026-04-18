@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 import time
 
-from app.clients.kalshi import paginate_historical_markets
+from app.clients.kalshi_rest import paginate_historical_markets
 from app.services.s3_raw import put_raw
 
 ALL_NBA_SERIES = [

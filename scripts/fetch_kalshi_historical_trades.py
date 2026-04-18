@@ -1,67 +1,81 @@
 """Fetch historical Kalshi trades for NBA markets and store in S3.
 
 Reads market tickers from S3 (run fetch_kalshi_historical_markets first), then
-fetches all trades for each market.
+fetches all trades for each market using a thread pool for concurrency.
 
 Usage:
-    python -m scripts.fetch_kalshi_trades
-    python -m scripts.fetch_kalshi_trades --max-markets 10
+    python -m scripts.fetch_kalshi_historical_trades                    # all NBA series
+    python -m scripts.fetch_kalshi_historical_trades --series KXNBAGAME # single series
+    python -m scripts.fetch_kalshi_historical_trades --workers 4        # 4 concurrent fetches
 """
 
 from __future__ import annotations
 
 import argparse
-import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from app.clients.kalshi import paginate_historical_trades
-from app.core.config import SERIES
+from app.clients.kalshi_rest import paginate_historical_trades
 from app.services.s3_raw import get_raw, put_raw, list_keys
+from scripts.fetch_kalshi_historical_markets import ALL_NBA_SERIES
+
+
+def _fetch_one(ticker: str) -> tuple[str, int]:
+    """Fetch trades for a single market and store in S3. Returns (ticker, count)."""
+    trades = list(paginate_historical_trades(ticker=ticker))
+    put_raw(
+        source="kalshi",
+        dataset="historical_trades",
+        key=f"{ticker}.json",
+        data=trades,
+    )
+    return ticker, len(trades)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--series", default=SERIES,
-                    help=f"Series ticker (default: {SERIES})")
+    ap.add_argument("--series", default=None,
+                    help="Single series ticker (default: fetch all NBA series)")
     ap.add_argument("--max-markets", type=int, default=None,
-                    help="Cap number of markets (for testing)")
-    ap.add_argument("--throttle", type=float, default=0.3,
-                    help="Seconds between API calls (default: 0.3)")
+                    help="Cap number of markets per series (for testing)")
+    ap.add_argument("--workers", type=int, default=4,
+                    help="Number of concurrent fetches (default: 4)")
     args = ap.parse_args()
 
-    try:
-        markets = get_raw(f"kalshi/historical_markets/{args.series}.json")
-    except Exception as e:
-        print(f"Could not read markets from S3: {e}")
-        print("Run `python -m scripts.fetch_kalshi_historical_markets` first.")
-        return
+    series_list = [args.series] if args.series else ALL_NBA_SERIES
 
-    tickers = [m["ticker"] for m in markets]
-    if args.max_markets:
-        tickers = tickers[:args.max_markets]
-
-    # Skip tickers already fetched
-    existing = set(list_keys("kalshi", "historical_trades"))
-    to_fetch = [t for t in tickers if f"kalshi/historical_trades/{t}.json" not in existing]
-    print(f"{len(tickers)} markets, {len(tickers) - len(to_fetch)} already in S3, {len(to_fetch)} to fetch")
-
-    for i, ticker in enumerate(to_fetch, 1):
+    # Collect all tickers across series
+    all_tickers: list[str] = []
+    for series in series_list:
         try:
-            trades = list(paginate_historical_trades(ticker=ticker))
+            markets = get_raw(f"kalshi/historical_markets/{series}.json")
         except Exception as e:
-            print(f"  [{i}/{len(to_fetch)}] {ticker}: error - {e}")
-            time.sleep(args.throttle)
+            print(f"Could not read {series} from S3: {e}")
             continue
+        tickers = [m["ticker"] for m in markets]
+        if args.max_markets:
+            tickers = tickers[:args.max_markets]
+        all_tickers.extend(tickers)
 
-        put_raw(
-            source="kalshi",
-            dataset="historical_trades",
-            key=f"{ticker}.json",
-            data=trades,
-        )
-        print(f"  [{i}/{len(to_fetch)}] {ticker}: {len(trades)} trades")
-        time.sleep(args.throttle)
+    existing = set(list_keys("kalshi", "historical_trades"))
+    to_fetch = [t for t in all_tickers if f"kalshi/historical_trades/{t}.json" not in existing]
+    print(f"{len(all_tickers)} total markets, {len(all_tickers) - len(to_fetch)} already in S3, {len(to_fetch)} to fetch")
+    print(f"Using {args.workers} workers\n")
 
-    print(f"\nDone. Stored trades for {len(to_fetch)} markets.")
+    done = 0
+    errors = 0
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        futures = {pool.submit(_fetch_one, t): t for t in to_fetch}
+        for future in as_completed(futures):
+            ticker = futures[future]
+            try:
+                _, count = future.result()
+                done += 1
+                print(f"  [{done + errors}/{len(to_fetch)}] {ticker}: {count} trades")
+            except Exception as e:
+                errors += 1
+                print(f"  [{done + errors}/{len(to_fetch)}] {ticker}: error - {e}")
+
+    print(f"\nDone. {done} succeeded, {errors} errors.")
 
 
 if __name__ == "__main__":
