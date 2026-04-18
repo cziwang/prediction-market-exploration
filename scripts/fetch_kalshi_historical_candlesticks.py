@@ -1,6 +1,6 @@
 """Fetch historical Kalshi candlesticks for NBA markets and store in S3.
 
-Reads market tickers from S3 (run fetch_kalshi_markets first), then
+Reads market tickers from S3 (run fetch_kalshi_historical_markets first), then
 fetches hourly candlestick data for each market's active period.
 
 Usage:
@@ -41,7 +41,7 @@ def main() -> None:
         markets = get_raw(f"kalshi/historical_markets/{args.series}.json")
     except Exception as e:
         print(f"Could not read markets from S3: {e}")
-        print("Run `python -m scripts.fetch_kalshi_markets` first.")
+        print("Run `python -m scripts.fetch_kalshi_historical_markets` first.")
         return
 
     if args.max_markets:

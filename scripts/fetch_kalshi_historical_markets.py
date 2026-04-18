@@ -1,8 +1,8 @@
 """Fetch all historical Kalshi NBA markets and store in S3.
 
 Usage:
-    python -m scripts.fetch_kalshi_markets
-    python -m scripts.fetch_kalshi_markets --series KXNBAGAME
+    python -m scripts.fetch_kalshi_historical_markets
+    python -m scripts.fetch_kalshi_historical_markets --series KXNBAGAME
 """
 
 from __future__ import annotations

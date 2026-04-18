@@ -1,10 +1,10 @@
-"""Fetch historical Kalshi fills for NBA markets and store in S3.
+"""Fetch historical Kalshi orders for NBA markets and store in S3.
 
-Requires auth. Reads market tickers from S3 (run fetch_kalshi_markets first).
+Requires auth. Reads market tickers from S3 (run fetch_kalshi_historical_markets first).
 
 Usage:
-    python -m scripts.fetch_kalshi_fills
-    python -m scripts.fetch_kalshi_fills --max-markets 10
+    python -m scripts.fetch_kalshi_orders
+    python -m scripts.fetch_kalshi_orders --max-markets 10
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from __future__ import annotations
 import argparse
 import time
 
-from app.clients.kalshi import paginate_historical_fills
+from app.clients.kalshi import paginate_historical_orders
 from app.core.config import SERIES
 from app.services.s3_raw import get_raw, put_raw, list_keys
 
@@ -31,20 +31,20 @@ def main() -> None:
         markets = get_raw(f"kalshi/historical_markets/{args.series}.json")
     except Exception as e:
         print(f"Could not read markets from S3: {e}")
-        print("Run `python -m scripts.fetch_kalshi_markets` first.")
+        print("Run `python -m scripts.fetch_kalshi_historical_markets` first.")
         return
 
     tickers = [m["ticker"] for m in markets]
     if args.max_markets:
         tickers = tickers[:args.max_markets]
 
-    existing = set(list_keys("kalshi", "historical_fills"))
-    to_fetch = [t for t in tickers if f"kalshi/historical_fills/{t}.json" not in existing]
+    existing = set(list_keys("kalshi", "historical_orders"))
+    to_fetch = [t for t in tickers if f"kalshi/historical_orders/{t}.json" not in existing]
     print(f"{len(tickers)} markets, {len(tickers) - len(to_fetch)} already in S3, {len(to_fetch)} to fetch")
 
     for i, ticker in enumerate(to_fetch, 1):
         try:
-            fills = list(paginate_historical_fills(ticker=ticker))
+            orders = list(paginate_historical_orders(ticker=ticker))
         except Exception as e:
             print(f"  [{i}/{len(to_fetch)}] {ticker}: error - {e}")
             time.sleep(args.throttle)
@@ -52,14 +52,14 @@ def main() -> None:
 
         put_raw(
             source="kalshi",
-            dataset="historical_fills",
+            dataset="historical_orders",
             key=f"{ticker}.json",
-            data=fills,
+            data=orders,
         )
-        print(f"  [{i}/{len(to_fetch)}] {ticker}: {len(fills)} fills")
+        print(f"  [{i}/{len(to_fetch)}] {ticker}: {len(orders)} orders")
         time.sleep(args.throttle)
 
-    print(f"\nDone. Stored fills for {len(to_fetch)} markets.")
+    print(f"\nDone. Stored orders for {len(to_fetch)} markets.")
 
 
 if __name__ == "__main__":
