@@ -4,9 +4,9 @@ Reads game IDs from the season games file in S3, fetches PBP from the NBA API,
 and stores one JSON file per game in S3.
 
 Usage (from repo root):
-    python -m scripts.fetch_play_by_play                          # 2024-25 season
-    python -m scripts.fetch_play_by_play --season 2023-24
-    python -m scripts.fetch_play_by_play --max-games 5            # quick test
+    python -m scripts.nba_stats.fetch_play_by_play                          # 2024-25 season
+    python -m scripts.nba_stats.fetch_play_by_play --season 2023-24
+    python -m scripts.nba_stats.fetch_play_by_play --max-games 5            # quick test
 
 ~1,400 games x 0.6s throttle = ~15 minutes for a full season.
 """

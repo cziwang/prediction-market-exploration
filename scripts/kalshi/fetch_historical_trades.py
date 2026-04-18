@@ -4,9 +4,9 @@ Reads market tickers from S3 (run fetch_kalshi_historical_markets first), then
 fetches all trades for each market using a thread pool for concurrency.
 
 Usage:
-    python -m scripts.fetch_kalshi_historical_trades                    # all NBA series
-    python -m scripts.fetch_kalshi_historical_trades --series KXNBAGAME # single series
-    python -m scripts.fetch_kalshi_historical_trades --workers 4        # 4 concurrent fetches
+    python -m scripts.kalshi.fetch_historical_trades                    # all NBA series
+    python -m scripts.kalshi.fetch_historical_trades --series KXNBAGAME # single series
+    python -m scripts.kalshi.fetch_historical_trades --workers 4        # 4 concurrent fetches
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from app.clients.kalshi_rest import paginate_historical_trades
 from app.services.s3_raw import get_raw, put_raw, list_keys
-from scripts.fetch_kalshi_historical_markets import ALL_NBA_SERIES
+from scripts.kalshi.fetch_historical_markets import ALL_NBA_SERIES
 
 
 def _fetch_one(ticker: str) -> tuple[str, int]:

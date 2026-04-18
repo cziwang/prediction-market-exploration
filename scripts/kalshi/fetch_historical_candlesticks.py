@@ -4,10 +4,10 @@ Reads market tickers from S3 (run fetch_kalshi_historical_markets first), then
 fetches hourly candlestick data for each market using a thread pool.
 
 Usage:
-    python -m scripts.fetch_kalshi_historical_candlesticks                    # all NBA series
-    python -m scripts.fetch_kalshi_historical_candlesticks --series KXNBAGAME # single series
-    python -m scripts.fetch_kalshi_historical_candlesticks --workers 4        # 4 concurrent
-    python -m scripts.fetch_kalshi_historical_candlesticks --interval 1440    # daily candles
+    python -m scripts.kalshi.fetch_historical_candlesticks                    # all NBA series
+    python -m scripts.kalshi.fetch_historical_candlesticks --series KXNBAGAME # single series
+    python -m scripts.kalshi.fetch_historical_candlesticks --workers 4        # 4 concurrent
+    python -m scripts.kalshi.fetch_historical_candlesticks --interval 1440    # daily candles
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from datetime import datetime
 
 from app.clients.kalshi_rest import get_historical_candlesticks
 from app.services.s3_raw import get_raw, put_raw, list_keys
-from scripts.fetch_kalshi_historical_markets import ALL_NBA_SERIES
+from scripts.kalshi.fetch_historical_markets import ALL_NBA_SERIES
 
 
 def _iso_to_ts(iso: str) -> int:

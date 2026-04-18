@@ -1,8 +1,8 @@
 """Fetch NBA game results and store raw JSON in S3.
 
 Usage (from repo root):
-    python -m scripts.fetch_nba_games                          # current season
-    python -m scripts.fetch_nba_games --season 2023-24         # specific season
+    python -m scripts.nba_stats.fetch_games                          # current season
+    python -m scripts.nba_stats.fetch_games --season 2023-24         # specific season
 """
 
 from __future__ import annotations
