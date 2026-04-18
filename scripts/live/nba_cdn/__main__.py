@@ -24,22 +24,14 @@ from dataclasses import dataclass
 
 import httpx
 
+from app.clients.nba_cdn import (
+    BOXSCORE_URL,
+    HEADERS,
+    ODDS_URL,
+    PBP_URL,
+    SCOREBOARD_URL,
+)
 from app.services.bronze_writer import BronzeWriter
-
-BASE_URL = "https://cdn.nba.com/static/json/liveData"
-SCOREBOARD_URL = f"{BASE_URL}/scoreboard/todaysScoreboard_00.json"
-ODDS_URL = f"{BASE_URL}/odds/odds_todaysGames.json"
-PBP_URL = f"{BASE_URL}/playbyplay/playbyplay_{{}}.json"
-BOXSCORE_URL = f"{BASE_URL}/boxscore/boxscore_{{}}.json"
-
-HEADERS = {
-    "Accept": "application/json",
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-}
 
 POLL_INTERVAL = 3.0
 SCOREBOARD_INTERVAL_IDLE = 300.0
