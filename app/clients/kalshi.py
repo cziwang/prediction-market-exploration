@@ -140,3 +140,55 @@ def get_historical_candlesticks(
         "end_ts": end_ts,
         "period_interval": period_interval,
     })
+
+
+def get_historical_orders(
+    *, ticker: str | None = None, limit: int = 1000, cursor: str | None = None,
+) -> dict:
+    """Fetch orders from the historical database (requires auth)."""
+    params: dict[str, Any] = {"limit": limit}
+    if ticker:
+        params["ticker"] = ticker
+    if cursor:
+        params["cursor"] = cursor
+    return _get("/historical/orders", params)
+
+
+def paginate_historical_orders(
+    *, ticker: str | None = None,
+) -> Iterator[dict]:
+    """Yield all historical orders, handling cursor pagination."""
+    cursor = None
+    while True:
+        resp = get_historical_orders(ticker=ticker, cursor=cursor)
+        for o in resp.get("orders") or []:
+            yield o
+        cursor = resp.get("cursor")
+        if not cursor:
+            return
+
+
+def get_historical_fills(
+    *, ticker: str | None = None, limit: int = 1000, cursor: str | None = None,
+) -> dict:
+    """Fetch fills from the historical database (requires auth)."""
+    params: dict[str, Any] = {"limit": limit}
+    if ticker:
+        params["ticker"] = ticker
+    if cursor:
+        params["cursor"] = cursor
+    return _get("/historical/fills", params)
+
+
+def paginate_historical_fills(
+    *, ticker: str | None = None,
+) -> Iterator[dict]:
+    """Yield all historical fills, handling cursor pagination."""
+    cursor = None
+    while True:
+        resp = get_historical_fills(ticker=ticker, cursor=cursor)
+        for f in resp.get("fills") or []:
+            yield f
+        cursor = resp.get("cursor")
+        if not cursor:
+            return
