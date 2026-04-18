@@ -13,6 +13,8 @@ import os
 from pathlib import Path
 from typing import Any, Iterator
 
+import time
+
 import requests
 from dotenv import load_dotenv
 from kalshi_python import KalshiClient as _SDKClient
@@ -59,9 +61,17 @@ def paginate_markets(
 # Raw HTTP helpers (historical endpoints not in SDK)
 # ---------------------------------------------------------------------------
 
-def _get(path: str, params: dict | None = None) -> dict:
-    """GET a JSON endpoint from the Kalshi API."""
-    resp = requests.get(f"{HOST}{path}", params=params)
+def _get(path: str, params: dict | None = None, _retries: int = 3) -> dict:
+    """GET a JSON endpoint from the Kalshi API, with retry on 429."""
+    for attempt in range(_retries):
+        resp = requests.get(f"{HOST}{path}", params=params)
+        if resp.status_code == 429:
+            wait = 2 ** (attempt + 1)
+            print(f"  rate limited, waiting {wait}s...")
+            time.sleep(wait)
+            continue
+        resp.raise_for_status()
+        return resp.json()
     resp.raise_for_status()
     return resp.json()
 
