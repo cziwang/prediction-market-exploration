@@ -51,8 +51,9 @@ The key property: `transform()` runs exactly once per event, and its output is s
 | Source | What | Interface | Client |
 |---|---|---|---|
 | `stats.nba.com` | Game results, play-by-play | `nba_api` SDK | `app/clients/nba_stats.py` |
-| `cdn.nba.com` | Live scoreboard, odds, box scores | REST (no auth) | `app/clients/nba_cdn.py` |
-| Kalshi (live) | Current markets, orderbook | `kalshi-python` SDK | `app/clients/kalshi_sdk.py` |
+| `cdn.nba.com` | Live scoreboard, odds, box scores, PBP | REST (no auth) | `app/clients/nba_cdn.py`, `scripts/live/nba_cdn/` |
+| Kalshi (live REST) | Current markets, orderbook | `kalshi-python` SDK | `app/clients/kalshi_sdk.py` |
+| Kalshi (live WS) | Orderbook snapshots + deltas | authenticated WebSocket | `scripts/live/kalshi_ws/` |
 | Kalshi (historical) | Settled markets, trades, candlesticks | REST | `app/clients/kalshi_rest.py` |
 
 ### S3 data layout
@@ -87,12 +88,30 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# Configure AWS CLI (for S3 storage)
+# Configure AWS CLI (for S3 storage). On EC2, an IAM instance profile
+# replaces this — boto3 picks credentials up automatically.
 aws configure
-
-# (Optional) Add Kalshi API keys for higher rate limits
-cp .env.example .env  # edit with your key ID and PEM path
 ```
+
+### Kalshi credentials
+
+Optional for the REST batch fetchers (higher rate limits), **required**
+for `scripts/live/kalshi_ws/` — Kalshi's WebSocket needs an
+authenticated handshake even for public market channels.
+
+1. Create an API key in Kalshi's settings UI; download the `.pem`
+   private key Kalshi only shows you once.
+2. Put the `.pem` outside any git-tracked directory (`keys/` in the
+   repo is gitignored) and `chmod 600` it.
+3. Create `.env` in the repo root with:
+
+   ```
+   KALSHI_API_KEY_ID=<uuid from kalshi>
+   KALSHI_PRIVATE_KEY_PATH=/absolute/path/to/kalshi-private-key.pem
+   ```
+
+   Use an absolute path for `KALSHI_PRIVATE_KEY_PATH`. `.env` is
+   gitignored; `chmod 600` it too.
 
 ## Usage
 
@@ -117,7 +136,13 @@ python -m scripts.kalshi.fetch_historical_candlesticks --workers 4 --interval 60
 
 # --- Live streaming ---
 python -m scripts.infra.smoke_test                             # end-to-end test of BronzeWriter + SilverWriter
+python -m scripts.live.nba_cdn                                 # NBA CDN → bronze (scoreboard, odds, live PBP, boxscore)
+python -m scripts.live.kalshi_ws                               # Kalshi WS → bronze (KXNBAGAME orderbook)
 ```
+
+For long-running deployment of the live ingesters under `systemd`,
+see [`docs/live-nba-cdn-service.md`](docs/live-nba-cdn-service.md) and
+[`docs/live-kalshi-ws-service.md`](docs/live-kalshi-ws-service.md).
 
 ## Kalshi NBA series
 
