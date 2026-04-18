@@ -1,0 +1,1 @@
+- [nba_api docs](reference_nba_api_docs.md) — GitHub repo for nba_api Python package docs
