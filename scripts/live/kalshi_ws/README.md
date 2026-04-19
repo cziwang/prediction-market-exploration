@@ -1,11 +1,11 @@
 # `scripts/live/kalshi_ws/`
 
 Live Kalshi WebSocket ingester. Connects to Kalshi's authenticated WS,
-subscribes to `orderbook_delta` for every currently-open KXNBAGAME
-market, and archives each raw frame to
+subscribes to `orderbook_delta` and `trade` for every currently-open
+market across the four NBA series `KXNBAGAME`, `KXNBASPREAD`,
+`KXNBATOTAL`, and `KXNBAPTS`, and archives each raw frame to
 `s3://prediction-markets-data/bronze/kalshi_ws/` via `BronzeWriter`.
-No transform, no silver — bronze only. v1 scope is deliberately narrow
-(one channel, one series) per `docs/data-flow.md` open question #5.
+No transform, no silver — bronze only.
 
 Entry point: `python -m scripts.live.kalshi_ws` (runs `__main__.py`).
 Related docs:
@@ -47,9 +47,11 @@ Full NBA series catalogue (from `CLAUDE.md`): `KXNBAGAME`,
 `KXNBA3PT`, `KXNBABLK`, `KXNBASTL`, `KXNBA` (Finals winner),
 `KXNBASERIES` (playoff series), `KXNBAPLAYOFF`, `KXNBAALLSTAR`.
 
-**v1 ingests `KXNBAGAME` only** — deliberately narrow while the WS
-path is unproven. Expanding is a one-line edit to `SERIES_TICKER` in
-`__main__.py` plus a service restart.
+**Current scope: `KXNBAGAME`, `KXNBASPREAD`, `KXNBATOTAL`, `KXNBAPTS`.**
+Game win/loss, point spread, total over/under, and player-points
+markets. The other NBA series (rebounds, assists, threes, etc.) are a
+one-line edit to `SERIES_TICKERS` in `__main__.py` plus a service
+restart.
 
 ### Channel
 
@@ -93,21 +95,29 @@ queries REST for open KXNBAGAME tickers and passes them explicitly.
 Event-driven stream rather than a poller. Each connect attempt:
 
 ```
-1. REST: list all open KXNBAGAME markets                   → N tickers
-2. Sign WS handshake (RSA-PSS on timestamp+GET+path)       → handshake headers
+1. REST (per series in SERIES_TICKERS):
+      list all open markets → {KXNBAGAME: [...], KXNBASPREAD: [...], ...}
+2. Sign WS handshake (RSA-PSS on timestamp+GET+path) → handshake headers
 3. Open WS to wss://api.elections.kalshi.com/trade-api/ws/v2
-4. Send {"cmd":"subscribe", "channels":["orderbook_delta"],
-         "market_tickers":[...all N tickers...]}
+4. For each non-empty series, send one subscribe:
+      {"id": N, "cmd":"subscribe",
+       "params":{"channels":["orderbook_delta","trade"],
+                 "market_tickers":[...tickers for that series...]}}
 5. async for each inbound frame:
-        emit to bronze with channel = frame["type"]
+      emit to bronze with channel = frame["type"]
 ```
 
+One subscribe per series (not per channel) because Kalshi's subscribe
+takes `market_tickers` but not `series_ticker` — it's cleaner to let
+the server assign a distinct `sid` per series so a future gap-handling
+path can resubscribe just the affected series.
+
 On disconnect: exponential backoff (1 s → 60 s), then reconnect. Every
-reconnect re-runs step 1 (so newly-opened markets get picked up) and
+reconnect re-runs step 1 (newly-opened markets get picked up) and
 produces a fresh `orderbook_snapshot` per market from Kalshi.
 
-On empty market list (off-season, deep off-hours): idle 300 s, then
-re-check.
+On empty market list (every series has 0 open markets — off-season,
+deep off-hours): idle 300 s, then re-check.
 
 Kalshi requires an authenticated connection even for public market
 channels. `KALSHI_API_KEY_ID` and `KALSHI_PRIVATE_KEY_PATH` must be
@@ -133,17 +143,21 @@ we might want a connection per series-group.
 
 ## Stream cadence
 
-Not a poll — Kalshi pushes. Observed frame volumes:
+Not a poll — Kalshi pushes. Observed frame volumes from a ~23 s
+smoke test at 494 subscribed markets across the four NBA series
+(KXNBAGAME=56, KXNBASPREAD=73, KXNBATOTAL=77, KXNBAPTS=288):
 
-| Context                           | Observed delta rate                            |
-|-----------------------------------|------------------------------------------------|
-| Off-hours, no live NBA game       | ~40 `orderbook_delta` msgs/sec across all open markets |
-| During a live NBA game            | expected 5–10× higher (not yet measured)       |
+| Frame type            | Count in 23 s | Rate            | Notes                                              |
+|-----------------------|---------------|-----------------|----------------------------------------------------|
+| `orderbook_snapshot`  | 494           | one-time burst  | One per market, right after each subscribe         |
+| `orderbook_delta`     | 5,355         | ~233/s          | Scales roughly with subscribed market count        |
+| `trade`               | 139           | ~6/s            | Only fires on executed trades; goes up during games|
+| `subscribed` / `ok`   | ~10           | once per connect| Control acks, tiny                                 |
 
-Snapshots (`orderbook_snapshot`) arrive exactly once per market per
-subscribe — so after a fresh connect you see one snapshot per
-subscribed market before deltas resume. Control messages
-(`subscribed`, `error`) are rare and tiny.
+During a live NBA game, expect `orderbook_delta` and `trade` rates
+to climb significantly — not yet measured. Snapshots only reappear on
+reconnect (or if a new market is added and the process next
+reconnects).
 
 Reconnect backoff uses module constants:
 
@@ -162,7 +176,10 @@ under their own tiny prefixes:
 ```
 bronze/kalshi_ws/orderbook_snapshot/YYYY/MM/DD/HH/{uuid}.jsonl.gz
 bronze/kalshi_ws/orderbook_delta/YYYY/MM/DD/HH/{uuid}.jsonl.gz
+bronze/kalshi_ws/trade/YYYY/MM/DD/HH/{uuid}.jsonl.gz
 bronze/kalshi_ws/subscribed/YYYY/MM/DD/HH/{uuid}.jsonl.gz
+bronze/kalshi_ws/unsubscribed/YYYY/MM/DD/HH/{uuid}.jsonl.gz
+bronze/kalshi_ws/ok/YYYY/MM/DD/HH/{uuid}.jsonl.gz
 bronze/kalshi_ws/error/YYYY/MM/DD/HH/{uuid}.jsonl.gz   # if Kalshi sends any
 ```
 
@@ -207,11 +224,13 @@ As a service on EC2: see
   transform will need to handle the gap by triggering a re-snapshot
   (unsubscribe + resubscribe). Deferred per `data-flow.md` open
   question #7.
-- **Single WS connection.** All subscribed markets share one
-  connection. If Kalshi ever enforces a per-connection subscription
-  cap below the number of open KXNBAGAME markets (~50–60), we'd need
-  to shard.
-- **Startup-only market discovery.** New KXNBAGAME markets added
-  mid-session are not picked up until the next reconnect. For
-  game-day operations this means a restart (or natural reconnect)
-  around new-market creation times.
+- **Single WS connection.** All ~500 subscribed markets across four
+  series share one connection. Kalshi doesn't document a per-connection
+  subscription cap, but if we fan out further (e.g. add rebounds,
+  assists, threes) or Kalshi enforces a limit, we'd need to shard —
+  natural split would be one connection per series.
+- **Startup-only market discovery.** New markets added mid-session
+  (e.g. tomorrow's games appearing on Kalshi mid-afternoon) are not
+  picked up until the next reconnect. For game-day operations this
+  means a restart (or natural reconnect) around new-market creation
+  times.

@@ -129,10 +129,10 @@ journalctl -u kalshi-live -f
 aws s3 ls s3://prediction-markets-data/bronze/kalshi_ws/ --recursive | tail
 ```
 
-During quiet hours you should still see dozens of delta records per
-second even without any live games, because KXNBAGAME markets trade
-around upcoming games too. During a live game, delta volume climbs
-significantly.
+During quiet hours you should still see hundreds of delta records per
+second across all subscribed markets, because all four series trade
+around upcoming games. During a live game, `orderbook_delta` and
+`trade` volumes climb significantly.
 
 ## Operations cheatsheet
 
@@ -166,24 +166,26 @@ sudo systemctl disable kalshi-live
 
 The ingester reconnects on its own with exponential backoff
 (`RECONNECT_INITIAL=1s`, capped at `RECONNECT_MAX=60s`). Reconnect
-triggers a fresh REST lookup of open KXNBAGAME markets and a new
-subscribe — which means a new `orderbook_snapshot` per market, which
-is what you want: the book is authoritative only after the most recent
-snapshot.
+triggers a fresh REST lookup of open markets per series and one new
+subscribe per series — which means a new `orderbook_snapshot` per
+market, which is what you want: the book is authoritative only after
+the most recent snapshot.
 
-If KXNBAGAME has no open markets (off-season, deep off-hours),
-`_connect_once()` returns without opening a connection and the loop
-idles for `NO_MARKETS_BACKOFF=300s` before re-checking. This keeps the
-process alive through the off-season without thrashing.
+If **every** series has zero open markets (off-season, deep
+off-hours), `_connect_once()` returns without opening a connection and
+the loop idles for `NO_MARKETS_BACKOFF=300s` before re-checking. This
+keeps the process alive through the off-season without thrashing.
 
 ### Scope
 
-v1 covers **only** the `orderbook_delta` channel on **only** the
-`KXNBAGAME` series, per `data-flow.md` open question #5. Expanding to
-other series (`KXNBASPREAD`, `KXNBATOTAL`, player props) or other
-channels (`trade`, `ticker`, `market_lifecycle_v2`) is a matter of
-editing `CHANNELS` and `SERIES_TICKER` in `scripts/live/kalshi_ws/__main__.py`
-and bouncing the service.
+Current coverage: `orderbook_delta` and `trade` channels across the
+`KXNBAGAME`, `KXNBASPREAD`, `KXNBATOTAL`, and `KXNBAPTS` series. ~500
+subscribed markets on a typical weekday evening. Expanding to the
+other NBA series (`KXNBAREB`, `KXNBAAST`, `KXNBA3PT`, `KXNBABLK`,
+`KXNBASTL`, etc.) or additional channels (`ticker`,
+`market_lifecycle_v2`) is a matter of editing `SERIES_TICKERS` and
+`CHANNELS` in `scripts/live/kalshi_ws/__main__.py` and bouncing the
+service.
 
 ### Crash-recovery caveat
 
