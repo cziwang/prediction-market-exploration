@@ -77,19 +77,6 @@ class Ingester:
         t_receipt = time.time()
         data = resp.json()
 
-        await self.bronze.emit(
-            {
-                "source": "nba_cdn",
-                "channel": "scoreboard",
-                "t_request": t_request,
-                "t_receipt": t_receipt,
-                "frame": data,
-            },
-            channel="scoreboard",
-        )
-
-        await self._poll_odds()
-
         by_status: dict[int, set[str]] = {}
         for g in data.get("scoreboard", {}).get("games", []):
             by_status.setdefault(g.get("gameStatus", 0), set()).add(g["gameId"])
@@ -97,6 +84,23 @@ class Ingester:
         active = by_status.get(2, set())
         final = by_status.get(3, set())
         scheduled = by_status.get(1, set())
+
+        # Only archive scoreboard + odds when the slate has anything on it.
+        # An empty slate (off-season / off-day) produces an identical empty
+        # games array every poll; writing that every 5 min clutters S3 and
+        # offers nothing to query later.
+        if active or final or scheduled:
+            await self.bronze.emit(
+                {
+                    "source": "nba_cdn",
+                    "channel": "scoreboard",
+                    "t_request": t_request,
+                    "t_receipt": t_receipt,
+                    "frame": data,
+                },
+                channel="scoreboard",
+            )
+            await self._poll_odds()
 
         for gid in active:
             if gid not in self.games and gid not in self.finalized:

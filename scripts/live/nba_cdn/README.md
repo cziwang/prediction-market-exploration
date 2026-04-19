@@ -71,6 +71,13 @@ fetched once per tick **per live game**. Etags on PBP / odds /
 boxscore mean 304 responses are free — no emission, no buffer growth,
 no S3 write downstream.
 
+**Empty-slate short-circuit.** When the scoreboard reports no games
+at all (off-season / off-day), the scoreboard response and the odds
+poll are **not archived** — the tick still runs (the fetch is needed
+to discover when games reappear), but no records are emitted. This
+keeps off-season S3 clutter at zero. Any non-empty slate (scheduled,
+live, or final games present) restores normal archival.
+
 ## Write cadence
 
 Responses that produce records are emitted into `BronzeWriter`'s
@@ -96,7 +103,7 @@ Rough PUTs/hour by scoreboard state, per channel, during steady state:
 |-----------------------------------------------|-----------|--------------|--------------------|--------------------|
 | Any game live (3 s tick)                      | ~60       | ≤ 60         | ~60 per active game window | ≤ 60 per active game |
 | Scheduled or recently final only (60 s tick)  | ~60       | ≤ 60         | 0                  | 0                  |
-| Empty slate (300 s tick)                      | ~12       | ≤ 12         | 0                  | 0                  |
+| Empty slate (300 s tick)                      | **0**     | **0**        | 0                  | 0                  |
 
 "≤" on `odds` and `boxscore` because they're etag-deduped — if the
 upstream response is unchanged, the channel's buffer gets no record
@@ -104,6 +111,12 @@ and the 60 s flush is a no-op. `live_pbp` emits one record per **new**
 action seen, not per tick, so its PUT count depends on how many new
 actions NBA adds per minute — typically a handful during active play,
 zero in timeouts and between periods.
+
+Empty-slate rows are zero by design: the tick short-circuits emission
+when the scoreboard reports no scheduled / live / final games (see
+"Empty-slate short-circuit" under Poll cadence). The HTTP call still
+happens — we need it to detect when games come back — but nothing
+lands in bronze.
 
 Timing note: flushes are triggered by two asyncio paths — a
 background `_flush_loop` task that wakes every `flush_seconds` and
