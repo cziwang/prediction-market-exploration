@@ -1,18 +1,22 @@
 """Live Kalshi WS ingester → bronze S3.
 
-Connects to Kalshi's WebSocket, subscribes to `orderbook_delta` for every
-currently-open KXNBAGAME market, and archives each raw frame to bronze
-via BronzeWriter. No transform, no silver — just archival.
+Connects to Kalshi's WebSocket, subscribes to `orderbook_delta` and
+`trade` for every currently-open market across the NBA series listed in
+``SERIES_TICKERS`` (game/spread/total/player-points), and archives each
+raw frame to bronze via BronzeWriter. No transform, no silver — just
+archival.
 
 Kalshi requires an authenticated connection even for public market data,
 so the handshake signs `timestamp + "GET" + path` with RSA-PSS using the
 same credentials as the REST client (`KALSHI_API_KEY_ID`,
 `KALSHI_PRIVATE_KEY_PATH`).
 
-Channels written to bronze are keyed by the server-provided message `type`
-(`orderbook_snapshot`, `orderbook_delta`, `ok`, `error`, ...), so the
-snapshot/delta split falls out naturally and control messages land under
-their own tiny prefixes.
+One subscribe command is issued per series (Kalshi's subscribe API takes
+``market_tickers`` but not ``series_ticker``), so each series lands on
+its own ``sid``. Bronze channels are keyed by the server-provided
+message `type` (`orderbook_snapshot`, `orderbook_delta`, `trade`, `ok`,
+`error`, ...), so snapshot/delta/trade splits fall out naturally and
+control messages land under their own tiny prefixes.
 
 Usage:
     python -m scripts.live.kalshi_ws
@@ -42,12 +46,17 @@ load_dotenv()
 WS_URL = "wss://api.elections.kalshi.com/trade-api/ws/v2"
 WS_SIGN_PATH = "/trade-api/ws/v2"
 
-SERIES_TICKER = "KXNBAGAME"
-CHANNELS = ["orderbook_delta"]
+SERIES_TICKERS = [
+    "KXNBAGAME",    # win/loss
+    "KXNBASPREAD",  # point spread
+    "KXNBATOTAL",   # total points over/under
+    "KXNBAPTS",     # player points
+]
+CHANNELS = ["orderbook_delta", "trade"]
 
 RECONNECT_INITIAL = 1.0
 RECONNECT_MAX = 60.0
-NO_MARKETS_BACKOFF = 300.0  # 5 min when KXNBAGAME has nothing open
+NO_MARKETS_BACKOFF = 300.0  # 5 min when every series has nothing open
 
 WS_PING_INTERVAL = 30
 WS_PING_TIMEOUT = 10
@@ -90,13 +99,16 @@ def _build_auth_headers() -> dict[str, str]:
     }
 
 
-def _fetch_open_tickers() -> list[str]:
-    """All currently-open KXNBAGAME market tickers via REST."""
+def _fetch_open_tickers_by_series() -> dict[str, list[str]]:
+    """Map of series → list of currently-open market tickers via REST."""
     api = make_client()
-    return [
-        m.ticker
-        for m in paginate_markets(api, series_ticker=SERIES_TICKER, status="open")
-    ]
+    return {
+        series: [
+            m.ticker
+            for m in paginate_markets(api, series_ticker=series, status="open")
+        ]
+        for series in SERIES_TICKERS
+    }
 
 
 class Ingester:
@@ -130,11 +142,18 @@ class Ingester:
                 pass
 
     async def _connect_once(self) -> bool:
-        tickers = await asyncio.to_thread(_fetch_open_tickers)
-        if not tickers:
-            log.warning("no open %s markets — idling", SERIES_TICKER)
+        by_series = await asyncio.to_thread(_fetch_open_tickers_by_series)
+        total = sum(len(t) for t in by_series.values())
+        if total == 0:
+            log.warning("no open markets across %s — idling", SERIES_TICKERS)
             return False
-        log.info("subscribing %s to %d markets", CHANNELS, len(tickers))
+        log.info(
+            "subscribing %s to %d markets across %d series (%s)",
+            CHANNELS,
+            total,
+            sum(1 for t in by_series.values() if t),
+            ", ".join(f"{s}={len(t)}" for s, t in by_series.items()),
+        )
 
         headers = _build_auth_headers()
         async with websockets.connect(
@@ -145,14 +164,19 @@ class Ingester:
         ) as ws:
             self._ws = ws
             try:
-                await ws.send(json.dumps({
-                    "id": 1,
-                    "cmd": "subscribe",
-                    "params": {
-                        "channels": CHANNELS,
-                        "market_tickers": tickers,
-                    },
-                }))
+                msg_id = 1
+                for series, tickers in by_series.items():
+                    if not tickers:
+                        continue
+                    await ws.send(json.dumps({
+                        "id": msg_id,
+                        "cmd": "subscribe",
+                        "params": {
+                            "channels": CHANNELS,
+                            "market_tickers": tickers,
+                        },
+                    }))
+                    msg_id += 1
                 async for raw in ws:
                     if self._shutdown.is_set():
                         break
