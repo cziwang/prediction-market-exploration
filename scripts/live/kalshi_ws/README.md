@@ -14,6 +14,80 @@ Related docs:
 - [`docs/live-kalshi-ws-service.md`](../../../docs/live-kalshi-ws-service.md) — systemd deployment + credential setup
 - [`docs/ec2-bootstrap.md`](../../../docs/ec2-bootstrap.md) — one-time EC2 setup
 
+## Kalshi concepts
+
+Two terms from Kalshi's API show up throughout this ingester: **series**
+and **channel**. They are independent axes — you pick a channel (the
+kind of updates you want) and a set of markets (often filtered by
+series) to subscribe to.
+
+### Series
+
+A **series** is a group of related markets sharing a ticker prefix. All
+NBA win/loss markets live under `KXNBAGAME`; all NBA point-spread
+markets live under `KXNBASPREAD`. A specific NBA game (e.g. Lakers @
+Celtics on 2026-04-18) is one *event*, and each series spawns one or
+more *markets* under that event:
+
+| Series        | Markets per game | Example ticker                         | What it trades                  |
+|---------------|------------------|----------------------------------------|---------------------------------|
+| `KXNBAGAME`   | 2 (one per team) | `KXNBAGAME-25APR18LALBOS-LAL`          | Will the Lakers win?            |
+| `KXNBASPREAD` | many             | `KXNBASPREAD-25APR18LALBOS-B3.5`       | Will BOS cover −3.5?            |
+| `KXNBATOTAL`  | many             | `KXNBATOTAL-25APR18LALBOS-T220.5`      | Will combined score be ≥ 220.5? |
+| `KXNBAPTS`    | many             | `KXNBAPTS-25APR18LALBOS-LJAMES-P30.5`  | Will LeBron score ≥ 30.5?       |
+
+Ticker anatomy: `<SERIES>-<EVENT_CODE>-<OUTCOME>` where `EVENT_CODE`
+encodes date + team-matchup (`25APR18LALBOS` = Apr 18 2025, LAL @ BOS)
+and `OUTCOME` identifies the specific market within that event
+(`LAL` = Lakers-win side; `B3.5` = Boston spread −3.5; etc.). Exact
+encoding varies by series.
+
+Full NBA series catalogue (from `CLAUDE.md`): `KXNBAGAME`,
+`KXNBASPREAD`, `KXNBATOTAL`, `KXNBAPTS`, `KXNBAREB`, `KXNBAAST`,
+`KXNBA3PT`, `KXNBABLK`, `KXNBASTL`, `KXNBA` (Finals winner),
+`KXNBASERIES` (playoff series), `KXNBAPLAYOFF`, `KXNBAALLSTAR`.
+
+**v1 ingests `KXNBAGAME` only** — deliberately narrow while the WS
+path is unproven. Expanding is a one-line edit to `SERIES_TICKER` in
+`__main__.py` plus a service restart.
+
+### Channel
+
+A **channel** is a named topic on Kalshi's WebSocket that carries a
+specific *kind* of update about whatever markets you've filtered to.
+Different channels carry different payloads about the same market.
+
+Public channels Kalshi exposes:
+
+| Channel                | Payload                                                          | When to use                                                      |
+|------------------------|------------------------------------------------------------------|------------------------------------------------------------------|
+| `orderbook_delta`      | `orderbook_snapshot` once + incremental deltas of bid/ask sizes  | Reconstruct the full order book. **What this ingester uses.**    |
+| `ticker`               | Top-of-book (best bid, best ask) + last trade + volume snapshot  | Lightweight price feed when you don't need book depth            |
+| `trade`                | One message per executed public trade                            | Build the trade tape / volume profile                            |
+| `market_lifecycle_v2`  | State transitions: opened, closed, determined, settled           | Know when a market stops accepting orders                        |
+| `event_lifecycle`      | Event-level meta (new event announced, strike date updated, …)   | Track the market calendar                                        |
+
+**Subscribe shape.** A subscribe command always names one or more
+channels plus a market filter. Channel and series are independent — a
+single subscription can pick any channel for any set of tickers from
+any series:
+
+```json
+{"id": 1, "cmd": "subscribe",
+ "params": {"channels": ["orderbook_delta", "trade"],
+            "market_tickers": ["KXNBAGAME-25APR18LALBOS-LAL",
+                               "KXNBAGAME-25APR18LALBOS-BOS"]}}
+```
+
+That one subscription would deliver **two** channels' worth of updates
+for **two** markets. The current ingester uses only `orderbook_delta`
+and passes the full list of open KXNBAGAME tickers at connect time.
+
+**Series filter on subscribe?** No such thing — Kalshi's subscribe API
+accepts `market_ticker` / `market_tickers` / `market_id` / `market_ids`
+as filters, but not `series_ticker`. That's why the ingester first
+queries REST for open KXNBAGAME tickers and passes them explicitly.
+
 ## Architecture
 
 Event-driven stream rather than a poller. Each connect attempt:
