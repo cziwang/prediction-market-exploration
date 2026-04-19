@@ -68,7 +68,52 @@ wins. Revisit if tick time ever approaches the interval.
 
 Scoreboard + odds are fetched once per tick. PBP + boxscore are
 fetched once per tick **per live game**. Etags on PBP / odds /
-boxscore mean 304 responses are free — no emission, no buffer growth.
+boxscore mean 304 responses are free — no emission, no buffer growth,
+no S3 write downstream.
+
+## Write cadence
+
+Responses that produce records are emitted into `BronzeWriter`'s
+in-memory buffers via `emit()`. Actual S3 writes happen only when a
+buffer flushes. Buffers are **per-channel and independent**, with
+three flush triggers (defaults from `app/services/bronze_writer.py`):
+
+| Trigger          | Threshold         | In practice for nba_cdn                                              |
+|------------------|-------------------|-----------------------------------------------------------------------|
+| Time elapsed     | 60 s              | **Dominant trigger.** Every active channel flushes once per minute.  |
+| Buffer size      | 5 MB uncompressed | Not observed at typical volume; boxscore might approach it on a busy night. |
+| Process shutdown | SIGINT / SIGTERM  | One-shot — drains every non-empty buffer before the process exits.   |
+
+Empty buffers are no-ops. A channel with zero queued records in its
+60 s window produces **zero** S3 writes. That's why in deep idle
+(off-season or an off-day) we only see the occasional scoreboard file
+— PBP / boxscore produce nothing at all until a game is actually live,
+and odds stays silent when `cdn.nba.com` returns 304 for hours.
+
+Rough PUTs/hour by scoreboard state, per channel, during steady state:
+
+| Scoreboard state                              | scoreboard | odds         | live_pbp           | boxscore           |
+|-----------------------------------------------|-----------|--------------|--------------------|--------------------|
+| Any game live (3 s tick)                      | ~60       | ≤ 60         | ~60 per active game window | ≤ 60 per active game |
+| Scheduled or recently final only (60 s tick)  | ~60       | ≤ 60         | 0                  | 0                  |
+| Empty slate (300 s tick)                      | ~12       | ≤ 12         | 0                  | 0                  |
+
+"≤" on `odds` and `boxscore` because they're etag-deduped — if the
+upstream response is unchanged, the channel's buffer gets no record
+and the 60 s flush is a no-op. `live_pbp` emits one record per **new**
+action seen, not per tick, so its PUT count depends on how many new
+actions NBA adds per minute — typically a handful during active play,
+zero in timeouts and between periods.
+
+Timing note: flushes are triggered by two asyncio paths — a
+background `_flush_loop` task that wakes every `flush_seconds` and
+calls `_flush_all()`, and an inline size-check after every `emit()`.
+Neither path blocks the poll loop: the actual `s3.put_object` call is
+offloaded to a thread via `asyncio.to_thread`, so polling continues
+while bytes are going over the wire.
+
+The writer is shared with `scripts/live/kalshi_ws/` — any tuning of
+`flush_seconds` or `flush_bytes` applies to both ingesters.
 
 ## What's written to S3
 
@@ -84,11 +129,6 @@ bronze/nba_cdn/boxscore/YYYY/MM/DD/HH/{uuid}.jsonl.gz
 
 UUID keeps flushes collision-free across restarts and parallel
 writers; `YYYY/MM/DD/HH` is the flush time (UTC), not the frame time.
-
-**Flush triggers** (from `BronzeWriter` defaults):
-- 5 MB of uncompressed JSONL in a single channel buffer
-- 60 s elapsed since the last flush (timer task)
-- process shutdown (SIGINT/SIGTERM drains all buffers)
 
 ## Record schema
 

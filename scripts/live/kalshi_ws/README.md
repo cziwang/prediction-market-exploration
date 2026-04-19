@@ -165,7 +165,50 @@ Reconnect backoff uses module constants:
 |-----------------------|--------|---------------------------------------------|
 | `RECONNECT_INITIAL`   | 1 s    | First retry after a session failure         |
 | `RECONNECT_MAX`       | 60 s   | Ceiling on exponential backoff              |
-| `NO_MARKETS_BACKOFF`  | 300 s  | Retry cadence when KXNBAGAME has 0 open markets |
+| `NO_MARKETS_BACKOFF`  | 300 s  | Retry cadence when **every** series has 0 open markets |
+
+## Write cadence
+
+Inbound frames are cheap — they land in `BronzeWriter`'s in-memory
+buffer via `emit()`. Actual S3 writes only happen when a buffer
+flushes. Buffers are **per-channel and independent**, with three
+flush triggers (defaults from `app/services/bronze_writer.py`):
+
+| Trigger          | Threshold         | In practice for kalshi_ws                                              |
+|------------------|-------------------|------------------------------------------------------------------------|
+| Time elapsed     | 60 s              | **Dominant trigger.** Every active channel flushes once per minute.    |
+| Buffer size      | 5 MB uncompressed | Not observed at off-hours volume. May fire on `orderbook_delta` during live NBA games. |
+| Process shutdown | SIGINT / SIGTERM  | One-shot — drains every non-empty buffer before the process exits.     |
+
+What that means for PUT volume at the smoke-test scope (494 markets,
+off-hours), per channel:
+
+| Channel                | Writes / hour         | Typical gzipped size per write         |
+|------------------------|-----------------------|-----------------------------------------|
+| `orderbook_delta`      | ~60 (one per minute)  | ~100–400 KB                             |
+| `trade`                | ~60 (one per minute)  | single-digit KB                         |
+| `orderbook_snapshot`   | only on reconnect     | ~70 KB (one PUT for all 494 markets)    |
+| `subscribed` / `unsubscribed` / `ok` | only on reconnect | <1 KB each                |
+
+So during normal steady-state: **~2 S3 PUTs per minute** total (one
+for `orderbook_delta`, one for `trade`), plus a handful of
+control-message PUTs after each reconnect.
+
+During a live NBA game, `orderbook_delta` traffic climbs and its
+buffer may hit the 5 MB threshold before the 60 s timer — meaning
+more frequent, similar-sized files rather than a single-large
+dump-every-minute pattern. Still safe; just denser. If the file
+count becomes a hotspot (Athena scans, S3 PUT cost), lower
+`BronzeWriter`'s `flush_seconds` or raise `flush_bytes` — the same
+writer is shared with `scripts/live/nba_cdn/`, so any tuning applies
+to both ingesters.
+
+Timing note: flushes are triggered by two asyncio paths — a
+background `_flush_loop` task that wakes every `flush_seconds` and
+calls `_flush_all()`, and inline size-check after every `emit()`.
+Neither path blocks the WS reader: the actual `s3.put_object` call
+is offloaded to a thread via `asyncio.to_thread`, so receiving and
+buffering continues while bytes are going over the wire.
 
 ## What's written to S3
 
@@ -182,8 +225,6 @@ bronze/kalshi_ws/unsubscribed/YYYY/MM/DD/HH/{uuid}.jsonl.gz
 bronze/kalshi_ws/ok/YYYY/MM/DD/HH/{uuid}.jsonl.gz
 bronze/kalshi_ws/error/YYYY/MM/DD/HH/{uuid}.jsonl.gz   # if Kalshi sends any
 ```
-
-Flush triggers are the same as `nba_cdn/` (5 MB, 60 s, or shutdown).
 
 ## Record schema
 
