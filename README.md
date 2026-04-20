@@ -11,15 +11,11 @@ Two parallel tracks running against the same S3 bucket.
 ```
          Data Sources                          Storage
     ┌───────────────────┐
-    │  stats.nba.com    │──┐
-    │  (nba_api SDK)    │  │
-    └───────────────────┘  │
-    ┌───────────────────┐  │   ┌──────────────────────┐
-    │  cdn.nba.com      │──┼──>│  S3 (raw JSON)       │
-    │  (REST)           │  │   │  prediction-markets- │
-    └───────────────────┘  │   │  data bucket          │
-    ┌───────────────────┐  │   └──────────────────────┘
-    │  Kalshi API       │──┘
+    │  cdn.nba.com      │──┐   ┌──────────────────────┐
+    │  (REST)           │  ├──>│  S3 (raw JSON)       │
+    └───────────────────┘  │   │  prediction-markets- │
+    ┌───────────────────┐  │   │  data bucket          │
+    │  Kalshi API       │──┘   └──────────────────────┘
     │  (SDK + REST)     │
     └───────────────────┘
 ```
@@ -50,8 +46,7 @@ The key property: `transform()` runs exactly once per event, and its output is s
 
 | Source | What | Interface | Client |
 |---|---|---|---|
-| `stats.nba.com` | Game results, play-by-play | `nba_api` SDK | `app/clients/nba_stats.py` |
-| `cdn.nba.com` | Live scoreboard, odds, box scores, PBP | REST (no auth) | `app/clients/nba_cdn.py`, `scripts/live/nba_cdn/` |
+| `cdn.nba.com` | Schedule, scoreboard, odds, box scores, PBP | REST (no auth) | `app/clients/nba_cdn.py`, `scripts/live/nba_cdn/` |
 | Kalshi (live REST) | Current markets, orderbook | `kalshi-python` SDK | `app/clients/kalshi_sdk.py` |
 | Kalshi (live WS) | Orderbook snapshots + deltas | authenticated WebSocket | `scripts/live/kalshi_ws/` |
 | Kalshi (historical) | Settled markets, trades, candlesticks | REST | `app/clients/kalshi_rest.py` |
@@ -60,10 +55,8 @@ The key property: `transform()` runs exactly once per event, and its output is s
 
 ```
 s3://prediction-markets-data/
-├── nba/                        # stats.nba.com (batch)
-│   ├── games/
-│   └── play_by_play/
 ├── nba_cdn/                    # cdn.nba.com (batch)
+│   ├── schedule/
 │   ├── scoreboard/
 │   ├── odds/
 │   ├── boxscore/
@@ -118,16 +111,14 @@ authenticated handshake even for public market channels.
 ```bash
 source .venv/bin/activate
 
-# --- NBA historical data (stats.nba.com) ---
-python -m scripts.nba_stats.fetch_games                        # 2024-25 season
-python -m scripts.nba_stats.fetch_games --season 2023-24       # specific season
-python -m scripts.nba_stats.fetch_play_by_play                 # PBP for all games
-
-# --- NBA live data (cdn.nba.com) ---
-python -m scripts.nba_cdn.fetch_scoreboard
-python -m scripts.nba_cdn.fetch_odds
-python -m scripts.nba_cdn.fetch_boxscores
-python -m scripts.nba_cdn.fetch_play_by_play
+# --- NBA data (cdn.nba.com) ---
+python -m scripts.nba_cdn.fetch_schedule                       # full season schedule (current season only)
+python -m scripts.nba_cdn.fetch_scoreboard                     # today's scoreboard
+python -m scripts.nba_cdn.fetch_odds                           # today's odds
+python -m scripts.nba_cdn.fetch_boxscores                      # today's box scores
+python -m scripts.nba_cdn.fetch_boxscores --season 2025-26     # backfill full season
+python -m scripts.nba_cdn.fetch_play_by_play                   # today's PBP
+python -m scripts.nba_cdn.fetch_play_by_play --season 2025-26  # backfill full season
 
 # --- Kalshi historical data ---
 python -m scripts.kalshi.fetch_historical_markets              # all NBA series (run first)
@@ -164,5 +155,5 @@ see [`docs/live-nba-cdn-service.md`](docs/live-nba-cdn-service.md) and
 
 ## Data coverage
 
-- **NBA**: 2024-25 season (preseason + regular + playoffs). ~1,401 games, ~690k plays.
+- **NBA**: All data from cdn.nba.com. Schedule endpoint serves current season only; PBP/boxscore endpoints work for historical game IDs.
 - **Kalshi**: April 2025 – February 2026. ~54k markets across all series. Historical cutoff is ~Feb 16, 2026.

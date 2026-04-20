@@ -14,10 +14,12 @@ from __future__ import annotations
 import requests
 
 BASE_URL = "https://cdn.nba.com/static/json/liveData"
+STATIC_URL = "https://cdn.nba.com/static/json/staticData"
 SCOREBOARD_URL = f"{BASE_URL}/scoreboard/todaysScoreboard_00.json"
 ODDS_URL = f"{BASE_URL}/odds/odds_todaysGames.json"
 PBP_URL = f"{BASE_URL}/playbyplay/playbyplay_{{}}.json"
 BOXSCORE_URL = f"{BASE_URL}/boxscore/boxscore_{{}}.json"
+SCHEDULE_URL = f"{STATIC_URL}/scheduleLeagueV2.json"
 
 HEADERS = {
     "Accept": "application/json",
@@ -39,27 +41,32 @@ def _get_session() -> requests.Session:
     return _session
 
 
-def _get(path: str) -> dict:
-    resp = _get_session().get(f"{BASE_URL}/{path}")
+def _get(url: str) -> dict:
+    resp = _get_session().get(url)
     resp.raise_for_status()
     return resp.json()
 
 
 def fetch_scoreboard() -> dict:
     """Fetch today's scoreboard (all games, scores, status)."""
-    return _get("scoreboard/todaysScoreboard_00.json")
+    return _get(SCOREBOARD_URL)
 
 
 def fetch_boxscore(game_id: str) -> dict:
     """Fetch live box score for a game."""
-    return _get(f"boxscore/boxscore_{game_id}.json")
+    return _get(BOXSCORE_URL.format(game_id))
 
 
 def fetch_play_by_play(game_id: str) -> dict:
     """Fetch live play-by-play for a game."""
-    return _get(f"playbyplay/playbyplay_{game_id}.json")
+    return _get(PBP_URL.format(game_id))
 
 
 def fetch_odds() -> dict:
     """Fetch betting odds for today's games."""
-    return _get("odds/odds_todaysGames.json")
+    return _get(ODDS_URL)
+
+
+def fetch_schedule() -> dict:
+    """Fetch the full season schedule (current season only)."""
+    return _get(SCHEDULE_URL)
