@@ -252,6 +252,64 @@ python -m scripts.live.kalshi_ws
 As a service on EC2: see
 [`docs/live-kalshi-ws-service.md`](../../../docs/live-kalshi-ws-service.md).
 
+## `conn_id`: scoping frames to a connection lifetime
+
+Every frame archived to bronze includes a `conn_id` field — a random
+UUID hex string generated once per WebSocket connection attempt (i.e.
+once per call to `_connect_once()`). All frames from the same
+connection share the same `conn_id`; a reconnect produces a new one.
+
+### Why it exists
+
+The problem it solves: **`sid` (subscription ID) is not globally
+unique.** Kalshi assigns `sid` sequentially starting from 1 on each
+connection. After a reconnect, the new connection also starts at
+`sid=1`. Without `conn_id`, there is no way to tell which snapshot a
+given delta belongs to — you might apply deltas from connection B to a
+snapshot from connection A, corrupting the reconstructed book.
+
+This matters for order book reconstruction:
+
+1. A snapshot seeds the book state for a specific market.
+2. Deltas update that state incrementally.
+3. Both are only valid within the same connection lifetime.
+
+If you mix deltas across connections, the reconstructed book drifts
+from reality — prices no longer add up, levels go negative, and you
+get **crossed books** (best bid > best ask), which are impossible on a
+real exchange.
+
+### How to use it downstream
+
+When reconstructing a book from bronze data:
+
+```python
+# Group by conn_id to isolate each connection's frames
+for conn_id, group in delta_df.groupby("conn_id"):
+    # Find the snapshot for this ticker from the SAME conn_id
+    snap = snap_df[
+        (snap_df["conn_id"] == conn_id) &
+        (snap_df["ticker"] == ticker)
+    ]
+    if snap.empty:
+        continue  # no snapshot for this connection — can't seed
+    # Seed from snapshot, then apply deltas in seq order
+    ...
+```
+
+Without `conn_id` scoping, the order book notebook's reconstruction
+showed 60% negative spreads — a direct result of applying deltas from
+one connection to a snapshot from another. Scoping by `conn_id`
+eliminates this class of error entirely.
+
+### When `conn_id` is missing
+
+Early bronze data (before the field was added) has `conn_id: null`.
+For those files, fall back to time-window heuristics: scope deltas to
+a window after the snapshot's `t_receipt`, and discard any
+reconstruction that produces crossed books. This is lossy but better
+than mixing connections blindly.
+
 ## Known limitations
 
 - **Same 60 s crash window as `nba_cdn/`**, but partly mitigated:
