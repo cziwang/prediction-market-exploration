@@ -31,6 +31,7 @@ import logging
 import os
 import signal
 import time
+import uuid
 from pathlib import Path
 
 import websockets
@@ -116,6 +117,7 @@ class Ingester:
         self.bronze = bronze
         self._shutdown = asyncio.Event()
         self._ws: websockets.ClientConnection | None = None
+        self._conn_id: str | None = None
 
     async def run(self) -> None:
         backoff = RECONNECT_INITIAL
@@ -142,6 +144,7 @@ class Ingester:
                 pass
 
     async def _connect_once(self) -> bool:
+        self._conn_id = uuid.uuid4().hex
         by_series = await asyncio.to_thread(_fetch_open_tickers_by_series)
         total = sum(len(t) for t in by_series.values())
         if total == 0:
@@ -198,6 +201,7 @@ class Ingester:
                 "source": "kalshi_ws",
                 "channel": channel,
                 "t_receipt": t_receipt,
+                "conn_id": self._conn_id,
                 "frame": frame,
             },
             channel=channel,
