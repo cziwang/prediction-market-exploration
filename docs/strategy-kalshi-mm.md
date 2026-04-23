@@ -283,6 +283,219 @@ async for raw in ws:
 
 This matches the architecture in `data-flow.md` exactly — the transform runs inline, its output feeds both strategy and silver simultaneously.
 
+## Replay and post-mortem analysis
+
+When something goes wrong — a bad fill, unexpected inventory, a P&L spike — we need to
+reconstruct exactly what the strategy saw and did, event by event. The replay system makes
+this possible without touching the live process.
+
+### What gets recorded (the three tapes)
+
+Every piece of information needed to replay a session is written to S3 during live trading:
+
+```
+1. BRONZE (raw WS frames — already exists)
+   bronze/kalshi_ws/orderbook_snapshot/...
+   bronze/kalshi_ws/orderbook_delta/...
+   bronze/kalshi_ws/trade/...
+   → What Kalshi sent us, byte-for-byte. Authoritative. Never modified.
+
+2. SILVER (typed events — transform output)
+   silver/kalshi_ws/OrderBookUpdate/date=.../v=N/...
+   silver/kalshi_ws/TradeEvent/date=.../v=N/...
+   → What the transform produced from bronze. Rebuildable.
+
+3. STRATEGY LOG (decisions + actions — NEW)
+   silver/kalshi_ws/MMQuoteEvent/date=.../v=N/...
+   silver/kalshi_ws/MMFillEvent/date=.../v=N/...
+   silver/kalshi_ws/MMOrderEvent/date=.../v=N/...
+   → What the strategy decided and what Kalshi confirmed. The audit trail.
+```
+
+Together, these three tapes let you answer: "at time T, what was the book state, what did
+the strategy decide, and what actually executed?"
+
+### Strategy log events
+
+Extend `app/events.py` with three strategy-level events (beyond the two already proposed):
+
+```python
+@dataclass(frozen=True)
+class MMOrderEvent:
+    """Every order placed or cancelled via the Kalshi REST API."""
+    t_receipt: float          # when we decided to place/cancel
+    t_ack: float | None       # when Kalshi acknowledged (None if failed/pending)
+    market_ticker: str
+    action: str               # "place_bid" | "place_ask" | "cancel" | "cancel_all"
+    price: int | None         # cents (None for cancel_all)
+    size: int | None
+    order_id: str | None      # Kalshi order ID (None if placement failed)
+    reason: str               # why: "spread_wide" | "position_limit" | "skew" |
+                              #      "flatten" | "shutdown" | "quote_update"
+    error: str | None         # None on success, error message on failure
+
+@dataclass(frozen=True)
+class MMQuoteEvent:
+    """Snapshot of the strategy's quoting decision on each book update."""
+    t_receipt: float
+    market_ticker: str
+    bid_price: int | None     # what we're posting (None = not quoting this side)
+    ask_price: int | None
+    book_bid: int             # what the market's best bid/ask is
+    book_ask: int
+    spread: int
+    position: int             # our net position on this ticker
+    reason_no_bid: str | None # why we're not bidding: "spread_narrow" | "pos_limit" | None
+    reason_no_ask: str | None
+
+@dataclass(frozen=True)
+class MMFillEvent:
+    """A confirmed fill on one of our resting orders."""
+    t_receipt: float
+    market_ticker: str
+    side: str                 # "buy" or "sell"
+    price: int                # cents
+    size: int
+    position_before: int
+    position_after: int
+    maker_fee: int            # cents
+    order_id: str
+    book_mid_at_fill: int     # for adverse selection measurement
+```
+
+Key design choices:
+- **`MMOrderEvent` logs every API call** including failures and the reason. This is the
+  most important tape for debugging: "why did we place that order? why did it fail?"
+- **`MMQuoteEvent` logs the decision, not just the action.** When we skip quoting, the
+  `reason_no_bid` / `reason_no_ask` field says why. This is critical for debugging
+  "why didn't we quote when the spread was wide?" scenarios.
+- **`MMFillEvent` captures `book_mid_at_fill`** so we can compute adverse selection on
+  live fills without reconstructing the book.
+
+### The replay tool: `scripts/replay/mm.py`
+
+A standalone script that replays a historical session through the strategy, offline.
+It reads bronze (or silver), feeds events through the same `KalshiTransform` +
+`MMStrategy` code, but with a `ReplayOrderClient` instead of the real Kalshi API.
+
+```python
+# scripts/replay/mm.py
+"""Replay a historical session through the MM strategy.
+
+Usage:
+    python -m scripts.replay.mm --date 2026-04-20 --ticker "KXNBAPTS-*"
+    python -m scripts.replay.mm --date 2026-04-20 --ticker "KXNBAPTS-26APR20ATLNYK-TREYOU25"
+    python -m scripts.replay.mm --from-bronze --date 2026-04-20   # replay from raw frames
+"""
+
+class ReplayOrderClient:
+    """Drop-in replacement for KalshiOrderClient. Logs orders instead of sending them."""
+    
+    def __init__(self):
+        self.order_log: list[dict] = []    # every place/cancel with timestamp
+        self.fills: list[dict] = []         # simulated fills
+    
+    async def place_limit(self, ticker, side, price_cents, size):
+        order_id = f"replay-{len(self.order_log)}"
+        self.order_log.append({
+            "t": current_replay_time,
+            "action": f"place_{side}",
+            "ticker": ticker,
+            "price": price_cents,
+            "size": size,
+            "order_id": order_id,
+        })
+        return order_id
+    
+    # ... cancel, cancel_all similarly logged
+
+async def replay(date: str, ticker_filter: str, from_bronze: bool = False):
+    config = MMConfig(...)  # same config as live, or override for experiments
+    client = ReplayOrderClient()
+    strategy = MMStrategy(client, config)
+    transform = KalshiTransform()
+    
+    if from_bronze:
+        # Read raw frames from bronze, apply transform (cold replay)
+        events = replay_from_bronze(date, ticker_filter)
+    else:
+        # Read typed events from silver (fast replay)
+        events = replay_from_silver(date, ticker_filter)
+    
+    for event in events:
+        strategy.on_event(event)
+    
+    # Output: full order log, simulated fills, P&L summary
+    return ReplayReport(client.order_log, client.fills, strategy.positions)
+```
+
+### Replay modes
+
+| Mode | Source | Speed | When to use |
+|---|---|---|---|
+| **Silver replay** | `silver/.../OrderBookUpdate/` + `TradeEvent/` | Fast (~seconds) | Quick P&L check, parameter sweep, "what would have happened with different config?" |
+| **Bronze replay** | `bronze/kalshi_ws/orderbook_delta/` + `trade/` | Slower (re-runs transform) | When you suspect a transform bug, or after updating the transform and want to regenerate results |
+| **Live-vs-replay diff** | Silver events + strategy log `MMQuoteEvent` / `MMOrderEvent` | Fast | Compare what the strategy actually did live vs what replay says it should have done. Any divergence = bug. |
+
+### The diff: live vs replay
+
+The most powerful debugging tool. After a session:
+
+```python
+# scripts/replay/diff.py
+"""Compare live strategy log against offline replay."""
+
+def diff_session(date: str):
+    # 1. Load live MMQuoteEvents from silver
+    live_quotes = load_silver("MMQuoteEvent", date)
+    
+    # 2. Replay the same events through the strategy
+    replay_quotes = replay(date, ticker_filter="KXNBAPTS-*")
+    
+    # 3. Compare, event by event
+    for live, replayed in align_by_timestamp(live_quotes, replay_quotes):
+        if live.bid_price != replayed.bid_price or live.ask_price != replayed.ask_price:
+            print(f"DIVERGENCE at {live.t_receipt}: "
+                  f"live bid={live.bid_price} ask={live.ask_price}, "
+                  f"replay bid={replayed.bid_price} ask={replayed.ask_price}")
+```
+
+If the live strategy and the replay strategy produce different quotes from the same
+events, something is non-deterministic — a bug. This catches:
+- State leaking between tickers
+- Time-dependent behavior (using wall clock instead of `t_receipt`)
+- Race conditions in the async order queue
+
+### Post-mortem notebook: `notebooks/strategies/mm_postmortem.ipynb`
+
+A template notebook for investigating specific sessions. Loads all three tapes for a
+given date and produces:
+
+1. **Timeline view**: book state + strategy quotes + fills on a single time axis
+2. **Why-did-we-trade table**: each fill with the `MMQuoteEvent` that triggered it,
+   the `MMOrderEvent` that placed the order, the book state at fill time, and the
+   adverse selection at 1/5/10/30/60s
+3. **Position waterfall**: how inventory accumulated, which fills contributed, which
+   games drove the imbalance
+4. **P&L attribution**: per-ticker, per-game, per-hour breakdown
+5. **What-if analysis**: re-run replay with different config (e.g., tighter position
+   limits) and compare P&L
+
+### Strategy determinism requirement
+
+For replay to be trustworthy, the strategy must be **deterministic given the same event
+stream**. This means:
+
+- **No wall-clock calls.** Use `event.t_receipt` for all timing decisions (e.g.,
+  "has the spread been wide for 5 seconds?"), never `time.time()`.
+- **No random number generation** unless seeded deterministically from event data.
+- **No external state queries** during `on_event()`. The strategy's state must be
+  fully reconstructable from the event stream. Position reconciliation with Kalshi's
+  API happens on a separate cadence (e.g., every 60 seconds), not inside `on_event()`.
+
+This is enforced by convention and by the live-vs-replay diff: any non-determinism
+shows up as a divergence.
+
 ## Risk management
 
 ### Position limits
@@ -366,11 +579,15 @@ If KXNBAPTS is profitable, evaluate KXNBATOTAL (showed positive edge at $0.03+, 
 | `app/strategy/mm.py` | **Create** | Quoting logic, position management, skewing |
 | `app/strategy/__init__.py` | **Create** | Package init |
 | `app/clients/kalshi_rest_orders.py` | **Create** | Place/cancel limit orders via REST |
-| `app/events.py` | **Modify** | Add `MMQuoteEvent`, `MMFillEvent` |
+| `app/events.py` | **Modify** | Add `MMQuoteEvent`, `MMFillEvent`, `MMOrderEvent` |
 | `scripts/live/kalshi_ws/__main__.py` | **Modify** | Wire transform + strategy + silver into main loop |
 | `app/core/config.py` | **Modify** | Add `MM_*` config vars (from env/defaults) |
+| `scripts/replay/mm.py` | **Create** | Offline replay: bronze/silver → strategy → ReplayReport |
+| `scripts/replay/diff.py` | **Create** | Live-vs-replay divergence detector |
+| `notebooks/strategies/mm_postmortem.ipynb` | **Create** | Template notebook for session post-mortems |
 | `tests/transforms/test_kalshi_ws.py` | **Create** | Golden-file tests for transform |
 | `tests/strategy/test_mm.py` | **Create** | Unit tests for quoting logic |
+| `tests/replay/test_determinism.py` | **Create** | Replay same session twice, assert identical output |
 
 ## Open questions
 
@@ -383,3 +600,7 @@ If KXNBAPTS is profitable, evaluate KXNBATOTAL (showed positive edge at $0.03+, 
 4. **Game-end timing.** Pre-settlement flattening needs to know when games end. Options: (a) NBA CDN live scoreboard polling (existing `nba_cdn` ingester), (b) Kalshi market lifecycle events (`market_lifecycle_v2` channel — not currently subscribed), (c) simple time heuristic (games rarely go past 11 PM ET).
 
 5. **Should the strategy run in-process or as a sidecar?** `data-flow.md` prescribes in-process for simplicity. But a bug in the strategy could crash the ingester, losing bronze data. Mitigation: the strategy's `on_event` is wrapped in a try/except — strategy exceptions log but don't propagate to the ingester loop.
+
+6. **Replay fill simulation.** During silver replay, we know what the book looked like and what orders we would have posted, but we don't know if those orders would have *filled* (that depends on other participants). Options: (a) optimistic — assume fills at our posted price when a matching trade appears (same as the notebook simulation), (b) conservative — only count fills confirmed by `MMFillEvent` from the live log. Silver replay uses (a) for what-if analysis; the live-vs-replay diff uses the live log as ground truth.
+
+7. **Strategy log volume.** `MMQuoteEvent` fires on every `OrderBookUpdate` for every quoted ticker. At 100 tickers × ~230 deltas/s, that's potentially ~23k events/s. Mitigation: only emit `MMQuoteEvent` when the quoting decision *changes* (new price, start/stop quoting), not on every book update. Rate-limit to at most 1 per ticker per second for unchanged states.
