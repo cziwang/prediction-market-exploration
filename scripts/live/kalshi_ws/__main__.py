@@ -41,6 +41,9 @@ from dotenv import load_dotenv
 
 from app.clients.kalshi_sdk import make_client, paginate_markets
 from app.services.bronze_writer import BronzeWriter
+from app.services.silver_writer import SilverWriter
+from app.strategy.mm import MMConfig, MMStrategy, PaperOrderClient
+from app.transforms.kalshi_ws import KalshiTransform
 
 load_dotenv()
 
@@ -113,8 +116,17 @@ def _fetch_open_tickers_by_series() -> dict[str, list[str]]:
 
 
 class Ingester:
-    def __init__(self, bronze: BronzeWriter) -> None:
+    def __init__(
+        self,
+        bronze: BronzeWriter,
+        transform: KalshiTransform | None = None,
+        strategy: MMStrategy | None = None,
+        silver: SilverWriter | None = None,
+    ) -> None:
         self.bronze = bronze
+        self._transform = transform
+        self._strategy = strategy
+        self._silver = silver
         self._shutdown = asyncio.Event()
         self._ws: websockets.ClientConnection | None = None
         self._conn_id: str | None = None
@@ -207,6 +219,27 @@ class Ingester:
             channel=channel,
         )
 
+        # --- Transform + strategy + silver (Phase 1: paper trading) ---
+        if self._transform is not None:
+            try:
+                events = self._transform(frame, t_receipt, conn_id=self._conn_id)
+            except Exception:
+                log.exception("transform error on %s", channel)
+                return
+            for event in events:
+                if self._strategy is not None:
+                    try:
+                        self._strategy.on_event(event)
+                    except Exception:
+                        log.exception("strategy error on %s", type(event).__name__)
+                if self._silver is not None:
+                    await self._silver.emit(event)
+            # Drain any strategy-generated events (MMQuoteEvent, MMFillEvent, etc.)
+            if self._strategy is not None and self._silver is not None:
+                for se in self._strategy.pending_events:
+                    await self._silver.emit(se)
+                self._strategy.pending_events.clear()
+
     def shutdown(self) -> None:
         log.info("shutdown requested")
         self._shutdown.set()
@@ -216,8 +249,28 @@ class Ingester:
 
 
 async def _main() -> None:
-    async with BronzeWriter(source="kalshi_ws") as bronze:
-        ingester = Ingester(bronze)
+    transform = KalshiTransform()
+    strategy: MMStrategy | None = None
+    client: PaperOrderClient | None = None
+
+    # Phase 1: paper trading (set MM_ENABLED=1 to activate)
+    mm_enabled = os.environ.get("MM_ENABLED", "0") == "1"
+    if mm_enabled:
+        config = MMConfig()
+        # Strategy and client are wired circularly
+        strategy = MMStrategy(order_client=None, config=config)  # type: ignore[arg-type]
+        client = PaperOrderClient(strategy)
+        strategy._client = client
+        log.info("MM strategy enabled (paper mode): %s", config)
+
+    async with BronzeWriter(source="kalshi_ws") as bronze, \
+               SilverWriter(source="kalshi_ws") as silver:
+        ingester = Ingester(
+            bronze,
+            transform=transform,
+            strategy=strategy if mm_enabled else None,
+            silver=silver,
+        )
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, ingester.shutdown)
