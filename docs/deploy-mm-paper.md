@@ -298,11 +298,17 @@ Do not proceed to Phase 2 until ALL of the following are met over at least 10 ga
 
 ### What Phase 2 requires
 
-1. Implementing `app/clients/kalshi_rest_orders.py` (real order placement)
-2. Adding the reconciliation loop and circuit breaker
-3. Adding startup recovery (`bootstrap()`)
-4. Replacing `PaperOrderClient` with `KalshiOrderClient` in `_main()`
-5. A separate deployment doc for live trading with real money
+1. Implementing `app/clients/kalshi_rest_orders.py` (real order placement via REST)
+2. Subscribing to private WS channels: `fill`, `user_orders`, `market_lifecycle_v2`, `market_positions`
+3. Wiring WS push callbacks: `on_ws_fill()`, `on_order_ack()` (from `user_orders`), `on_market_close()`, `on_position_update()`
+4. Adding `client_order_id` correlation between REST placement and `user_orders` ACK
+5. Adding the reconciliation loop (REST fallback) and circuit breaker
+6. Adding startup recovery (`bootstrap()` — cancel orphans, seed positions from REST)
+7. Replacing `PaperOrderClient` with `KalshiOrderClient` in `_main()`
+8. A separate deployment doc for live trading with real money (`docs/deploy-mm-live.md`)
+
+See [`docs/strategy-kalshi-mm.md`](strategy-kalshi-mm.md) for the full Phase 2 design,
+including WS channel architecture and push-based order lifecycle.
 
 **Do not skip Phase 1.** The paper P&L, fill rate, quote frequency, adverse selection,
 and position behavior are the validation gate. Paper results that don't clear the

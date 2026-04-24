@@ -1,26 +1,14 @@
 # prediction-market-exploration
 
-Collecting NBA game data and Kalshi prediction market data for analysis and backtesting quantitative sports betting strategies.
+Collecting NBA game data and Kalshi prediction market data, running a live market making strategy on KXNBAPTS (player points) contracts.
 
 ## Architecture
 
-Two parallel tracks running against the same S3 bucket.
+Three tracks running against the same S3 bucket.
 
-**Batch fetchers** — one-shot historical pulls:
+**Batch fetchers** — one-shot historical pulls from cdn.nba.com and Kalshi REST API into S3 (raw JSON, deterministic keys).
 
-```
-         Data Sources                          Storage
-    ┌───────────────────┐
-    │  cdn.nba.com      │──┐   ┌──────────────────────┐
-    │  (REST)           │  ├──>│  S3 (raw JSON)       │
-    └───────────────────┘  │   │  prediction-markets- │
-    ┌───────────────────┐  │   │  data bucket          │
-    │  Kalshi API       │──┘   └──────────────────────┘
-    │  (SDK + REST)     │
-    └───────────────────┘
-```
-
-**Live streaming** (in progress) — long-running process per source, fans each raw frame four ways in-process:
+**Live streaming** — long-running process per source, deployed on EC2 via systemd:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -35,12 +23,15 @@ Two parallel tracks running against the same S3 bucket.
 └─────────────────────────────────────────────────────────────┘
 ```
 
+**Market making strategy** — passive MM on Kalshi KXNBAPTS player prop markets. Posts limit orders at best bid/ask when spreads are wide enough to cover fees. Phase 1 (paper trading) is deployed; Phase 2 (live trading with real orders) is designed and pending implementation. Full design in [`docs/strategy-kalshi-mm.md`](docs/strategy-kalshi-mm.md).
+
 The key property: `transform()` runs exactly once per event, and its output is simultaneously what the strategy sees live and what silver stores for backtests. Structural parity. Full design in [`docs/data-flow.md`](docs/data-flow.md).
 
 ### Data flow
 
 1. **Batch fetchers** — clients call external APIs, raw JSON written to S3 with deterministic keys (idempotent; re-runs skip existing data).
 2. **Live streaming** — per-source process ingests raw frames, writes gzipped JSONL to `bronze/`, runs `transform()` inline, feeds the strategy, and serializes typed events to Parquet under `silver/`. Bronze is authoritative; silver is rebuildable.
+3. **Strategy** — `MMStrategy` receives typed events from the transform, makes quoting decisions via an order state machine, and emits strategy events (`MMQuoteEvent`, `MMFillEvent`, `MMOrderEvent`) to silver. Phase 1 uses `PaperOrderClient` (simulated fills); Phase 2 uses `KalshiOrderClient` (REST placement) + WS push channels (`fill`, `user_orders`) for authoritative notifications.
 
 ### Data sources
 
@@ -48,7 +39,7 @@ The key property: `transform()` runs exactly once per event, and its output is s
 |---|---|---|---|
 | `cdn.nba.com` | Schedule, scoreboard, odds, box scores, PBP | REST (no auth) | `app/clients/nba_cdn.py`, `scripts/live/nba_cdn/` |
 | Kalshi (live REST) | Current markets, orderbook | `kalshi-python` SDK | `app/clients/kalshi_sdk.py` |
-| Kalshi (live WS) | Orderbook snapshots + deltas | authenticated WebSocket | `scripts/live/kalshi_ws/` |
+| Kalshi (live WS) | Orderbook snapshots + deltas, fills, order updates | authenticated WebSocket | `scripts/live/kalshi_ws/` |
 | Kalshi (historical) | Settled markets, trades, candlesticks | REST | `app/clients/kalshi_rest.py` |
 
 ### S3 data layout
@@ -126,14 +117,32 @@ python -m scripts.kalshi.fetch_historical_trades --workers 4
 python -m scripts.kalshi.fetch_historical_candlesticks --workers 4 --interval 60
 
 # --- Live streaming ---
-python -m scripts.infra.smoke_test                             # end-to-end test of BronzeWriter + SilverWriter
-python -m scripts.live.nba_cdn                                 # NBA CDN → bronze (scoreboard, odds, live PBP, boxscore)
-python -m scripts.live.kalshi_ws                               # Kalshi WS → bronze (KXNBAGAME orderbook)
+python -m scripts.infra.smoke_test                             # end-to-end BronzeWriter + SilverWriter test
+python -m scripts.live.nba_cdn                                 # NBA CDN → bronze + silver
+python -m scripts.live.kalshi_ws                               # Kalshi WS → bronze + transform + silver
+MM_ENABLED=1 python -m scripts.live.kalshi_ws                  # with paper trading MM strategy
+
+# --- Tests ---
+python -m pytest tests/ -v                                     # all tests (32)
 ```
 
-For long-running deployment of the live ingesters under `systemd`,
-see [`docs/live-nba-cdn-service.md`](docs/live-nba-cdn-service.md) and
-[`docs/live-kalshi-ws-service.md`](docs/live-kalshi-ws-service.md).
+For long-running deployment under `systemd`, see:
+- [`docs/live-nba-cdn-service.md`](docs/live-nba-cdn-service.md)
+- [`docs/live-kalshi-ws-service.md`](docs/live-kalshi-ws-service.md)
+- [`docs/deploy-mm-paper.md`](docs/deploy-mm-paper.md) (Phase 1 paper trading)
+- [`docs/deploy-mm-live.md`](docs/deploy-mm-live.md) (Phase 2 live trading)
+
+## Documentation
+
+| Doc | Description |
+|---|---|
+| [`docs/data-flow.md`](docs/data-flow.md) | Live pipeline architecture (bronze/silver/transform/strategy) |
+| [`docs/strategy-kalshi-mm.md`](docs/strategy-kalshi-mm.md) | MM strategy design: state machine, WS channels, quoting logic, replay |
+| [`docs/deploy-mm-paper.md`](docs/deploy-mm-paper.md) | Phase 1 deployment: paper trading, monitoring, graduation criteria |
+| [`docs/deploy-mm-live.md`](docs/deploy-mm-live.md) | Phase 2 deployment: live trading, WS push channels, reconciliation |
+| [`docs/ec2-bootstrap.md`](docs/ec2-bootstrap.md) | EC2 instance setup |
+| [`docs/live-kalshi-ws-service.md`](docs/live-kalshi-ws-service.md) | Kalshi WS systemd service |
+| [`docs/live-nba-cdn-service.md`](docs/live-nba-cdn-service.md) | NBA CDN systemd service |
 
 ## Kalshi NBA series
 

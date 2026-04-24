@@ -21,49 +21,114 @@ KXNBAPTS works because of structural fragmentation: hundreds of player/game/thre
 
 The strategy plugs into the existing live pipeline defined in [`docs/data-flow.md`](data-flow.md). It runs inline in the Kalshi WS live process — no new process, no new infra.
 
+### Phase 1 (paper trading — current)
+
+Paper mode simulates orders locally. The WS connection subscribes to public channels only (`orderbook_delta` + `trade`). Fill detection is simulated by matching the public trade stream against resting paper orders.
+
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │  scripts/live/kalshi_ws (existing process)                      │
 │                                                                 │
-│    WS ingester (existing)                                       │
+│    WS ingester                                                  │
 │         │                                                       │
-│         │  raw frame                                            │
-│         ├──────────▶  BronzeWriter  (existing)                  │
+│         │  raw frame (orderbook_delta, trade)                   │
+│         ├──────────▶  BronzeWriter                              │
 │         │                                                       │
 │         ▼                                                       │
-│    transform()  (NEW — app/transforms/kalshi_ws.py)             │
+│    KalshiTransform  (app/transforms/kalshi_ws.py)               │
 │         │                                                       │
-│         │  OrderBookUpdate | TradeEvent                         │
-│         ├──────────▶  MMStrategy.on_event()  (NEW)              │
+│         │  OrderBookUpdate | TradeEvent | BookInvalidated        │
+│         ├──────────▶  MMStrategy.on_event()                     │
 │         │                   │                                   │
-│         │                   │  Place/cancel limit orders        │
+│         │                   │  Simulated place/cancel           │
 │         │                   ▼                                   │
-│         │              Kalshi REST API                          │
+│         │              PaperOrderClient (in-memory)             │
 │         │                                                       │
-│         └──────────▶  SilverWriter  (existing, not yet wired)   │
+│         └──────────▶  SilverWriter                              │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+### Phase 2 (live trading)
+
+Live mode uses Kalshi's authenticated WS push channels for order lifecycle, replacing trade-stream inference with authoritative notifications. Order placement and cancellation remain REST calls (Kalshi has no WS order submission), but ACKs and fills arrive via push.
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  scripts/live/kalshi_ws (same process)                               │
+│                                                                      │
+│    WS connection (authenticated)                                     │
+│         │                                                            │
+│         │  PUBLIC CHANNELS                                           │
+│         │  orderbook_delta, trade                                    │
+│         ├──────────▶  BronzeWriter                                   │
+│         │                                                            │
+│         ▼                                                            │
+│    KalshiTransform                                                   │
+│         │  OrderBookUpdate | TradeEvent | BookInvalidated             │
+│         ├──────────▶  MMStrategy.on_event()                          │
+│         │                   │                                        │
+│         │                   │  Place/cancel (REST)                   │
+│         │                   ▼                                        │
+│         │              KalshiOrderClient ──▶ Kalshi REST API         │
+│         │                                                            │
+│         │  PRIVATE CHANNELS (push, not polling)                      │
+│         │  ┌─────────────────────────────────────────────┐           │
+│         │  │ fill         → strategy.on_fill()           │           │
+│         │  │ user_orders  → strategy.on_order_ack()      │           │
+│         │  │              → strategy.on_cancel_ack()     │           │
+│         │  │              → strategy.on_order_rejected() │           │
+│         │  │ market_lifecycle_v2                          │           │
+│         │  │              → strategy.on_market_close()   │           │
+│         │  │ market_positions                             │           │
+│         │  │              → reconciliation sanity check   │           │
+│         │  └─────────────────────────────────────────────┘           │
+│         │                                                            │
+│         └──────────▶  SilverWriter                                   │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### Kalshi WebSocket channels
+
+The Kalshi WS API provides 11 channels. Here's what we use and why:
+
+| Channel | Auth | Phase | Purpose |
+|---|---|---|---|
+| **`orderbook_delta`** | Yes | 1, 2 | Real-time book state — snapshot + incremental deltas. Core input for spread calculation. |
+| **`trade`** | Yes | 1, 2 | Public trade feed. Bronze archival + paper fill simulation (Phase 1). Market signal (Phase 2). |
+| **`fill`** | Yes | 2 | **Push** fill notifications on our orders. Replaces trade-stream matching. Fields: `trade_id`, `order_id`, `count_fp`, `is_taker`, `post_position_fp`, `fee_cost`. |
+| **`user_orders`** | Yes | 2 | **Push** order state changes. Maps to `on_order_ack()` (status=resting), `on_cancel_ack()` (status=canceled), `on_order_rejected()`. Fields: `status`, `remaining_count_fp`, maker/taker fees. |
+| **`market_lifecycle_v2`** | Yes | 2 | Market created/activated/deactivated/determined/settled. Triggers pre-settlement flattening and stop-quoting on market close. Resolves game-end timing (see resolved questions). |
+| **`market_positions`** | Yes | 2 | Push position updates with cost basis, realized PnL, fees. Continuous sanity check against internal `_positions`. |
+| `ticker` | Yes | — | Aggregated best bid/ask, volume, OI. Redundant if we maintain our own book from `orderbook_delta`. |
+| `order_group_updates` | Yes | — | For Kalshi's grouped/contingent orders feature. Not used. |
+| `communications` | Yes | — | RFQ (Request for Quote) for OTC block trading. Not used. |
+| `multivariate_market_lifecycle` | Yes | Future | Same lifecycle events but for multivariate (multi-outcome) markets. Useful if we quote across multiple strike levels of the same player prop event. |
+| `multivariate_lookup` | Yes | Future | Maps collection → event → market relationships. Would tell us which KXNBAPTS thresholds belong to the same underlying event, enabling cross-market risk management. |
+
+**Key architectural change in Phase 2:** In Phase 1, the strategy infers fills from the public trade stream and receives instant ACKs from `PaperOrderClient`. In Phase 2, fills and ACKs are **pushed by Kalshi** via authenticated WS channels (`fill` and `user_orders`). This eliminates trade-stream matching (which could miss fills or misattribute them), provides authoritative fill data (including `fee_cost` and `post_position_fp`), and delivers order state changes in real time without REST polling.
+
 ### What exists today
 
-- **Ingester** (`scripts/live/kalshi_ws/__main__.py`): connects to WS, subscribes to `orderbook_delta` + `trade` for KXNBAGAME/KXNBASPREAD/KXNBATOTAL/KXNBAPTS, archives raw frames to bronze. Working, deployed.
+- **Ingester** (`scripts/live/kalshi_ws/__main__.py`): connects to WS, subscribes to `orderbook_delta` + `trade` for KXNBAGAME/KXNBASPREAD/KXNBATOTAL/KXNBAPTS, archives raw frames to bronze, runs transform + paper strategy + silver. Working, deployed.
 - **BronzeWriter** (`app/services/bronze_writer.py`): async batched gzip-JSONL to S3. Working.
-- **SilverWriter** (`app/services/silver_writer.py`): async batched Parquet to S3. Working but not wired into the live process.
-- **Event types** (`app/events.py`): `OrderBookUpdate`, `TradeEvent`. Defined, not yet produced by the live process.
+- **SilverWriter** (`app/services/silver_writer.py`): async batched Parquet to S3. Working, wired into the live process.
+- **Transform** (`app/transforms/kalshi_ws.py`): raw frame → `OrderBookUpdate` | `TradeEvent` | `BookInvalidated`. Working.
+- **Strategy** (`app/strategy/mm.py`): order state machine, quoting logic, paper fill simulation. Working.
+- **Event types** (`app/events.py`): `OrderBookUpdate`, `TradeEvent`, `BookInvalidated`, `MMQuoteEvent`, `MMFillEvent`, `MMOrderEvent`. Working.
 
-### What we build
-
-Four new components, in dependency order:
+### What we build for Phase 2
 
 ```
 app/
-├── transforms/
-│   └── kalshi_ws.py          # NEW: raw frame → OrderBookUpdate | TradeEvent
-├── strategy/
-│   └── mm.py                 # NEW: the market making strategy
 ├── clients/
 │   └── kalshi_rest_orders.py # NEW: place/cancel limit orders via REST
-└── events.py                 # EXTEND: add MMFill, MMQuote events for logging
+├── strategy/
+│   └── mm.py                 # MODIFY: add on_ws_fill(), on_ws_order_update(),
+│                             #          on_market_lifecycle(), reconciliation loop
+└── events.py                 # EXTEND: add MMReconcileEvent, MMCircuitBreakerEvent
+scripts/live/kalshi_ws/
+└── __main__.py               # MODIFY: subscribe to private channels, wire push
+                              #          callbacks, add bootstrap(), reconciliation
 ```
 
 ## Component design
@@ -168,13 +233,23 @@ The single largest source of accidental double-exposure is sending a new order w
 
 This prevents ghost orders: if two `OrderBookUpdate` events arrive in rapid succession, the second sees `pending` state and skips the order intent.
 
+**YES-side orders only.** The strategy always operates on the YES side of binary contracts: "bid" = buy YES at our bid price, "ask" = sell YES at our ask price. This simplifies the mapping between internal state (`bid`/`ask`) and Kalshi's API (`side`=yes/no, `action`=buy/sell). Specifically:
+- Place bid → REST `side="yes", action="buy"` at `price_cents`
+- Place ask → REST `side="yes", action="sell"` at `price_cents`
+- Fill on bid → WS `fill` message with `action="buy"`
+- Fill on ask → WS `fill` message with `action="sell"`
+
+The dispatcher asserts this mapping (`assert msg["action"] == expected_action`) to catch misconfigurations. If we ever need to post NO-side orders, the mapping and assertions must be updated.
+
 ```python
 class OrderSideState:
     """State machine for one side (bid or ask) of one ticker."""
     state: str = "idle"       # idle | pending | resting | cancel_pending
     order_id: str | None = None
+    client_order_id: str | None = None   # Phase 2: correlate REST → WS ACK
     price: int | None = None
     remaining_size: int = 0   # tracks partial fills
+    t_entered: float = 0.0    # Phase 2: when state was entered (for timeout)
 
 class MMStrategy:
     """Passive market maker on KXNBAPTS."""
@@ -187,6 +262,17 @@ class MMStrategy:
         self._order_state: dict[str, dict[str, OrderSideState]] = {}
             # ticker → {"bid": OrderSideState, "ask": OrderSideState}
         self._circuit_breaker: bool = False               # True = suppress all orders
+        
+        # Phase 2: correlation tables for WS push channels
+        self._client_order_map: dict[str, tuple[str, str]] = {}
+            # client_order_id → (ticker, side) — populated at placement,
+            # consumed when user_orders ACK arrives
+        self._order_id_map: dict[str, tuple[str, str]] = {}
+            # order_id → (ticker, side) — populated at ACK,
+            # consumed by fill and cancel_ack dispatchers
+        self._pending_cancel: set[str] = set()
+            # client_order_ids that should be cancelled as soon as ACK arrives
+            # (e.g., pending order when BookInvalidated fires)
     
     def on_event(self, event: Event) -> None:
         if isinstance(event, OrderBookUpdate):
@@ -249,6 +335,10 @@ class MMStrategy:
         if state.state == "idle":
             state.state = "pending"
             state.price = price
+            state.remaining_size = self._config.order_size
+            state.client_order_id = str(uuid4())  # Phase 2: for WS ACK correlation
+            state.t_entered = time.time()          # Phase 2: for timeout detection
+            self._client_order_map[state.client_order_id] = (ticker, side)
             self._enqueue_place(ticker, side, price)
         elif state.state == "resting" and state.price != price:
             # Price changed — cancel old, will re-place on ACK
@@ -261,27 +351,69 @@ class MMStrategy:
         ticker = event.market_ticker
         for side in ["bid", "ask"]:
             state = self._get_side_state(ticker, side)
-            if state.state in ("resting", "pending"):
+            if state.state == "resting":
                 state.state = "cancel_pending"
                 self._enqueue_cancel(ticker, side, state.order_id)
+            elif state.state == "pending":
+                # Order may still be in-flight on REST. We can't cancel it
+                # because we don't have an order_id yet. Track the
+                # client_order_id in _pending_cancel so that when the
+                # user_orders ACK arrives, we immediately cancel it.
+                # (Phase 1 paper mode resets to idle since ACKs are instant.)
+                if state.client_order_id:
+                    self._pending_cancel.add(state.client_order_id)
+                state.state = "idle"
+                state.order_id = None
     
-    def on_order_ack(self, ticker: str, side: str, order_id: str) -> None:
-        """Called by the order queue drainer when Kalshi confirms a placement."""
+    def on_order_ack(self, ticker: str, side: str, order_id: str,
+                     client_order_id: str | None = None) -> None:
+        """Called when Kalshi confirms a placement.
+        
+        Phase 1: called by PaperOrderClient with (ticker, side, order_id).
+        Phase 2: called by WS dispatcher which looks up (ticker, side) from
+                 _client_order_map using the client_order_id in the
+                 user_orders message, then passes all four args.
+        """
         state = self._get_side_state(ticker, side)
+        
+        # Phase 2: check if this order was marked for immediate cancel
+        # (e.g., BookInvalidated fired while order was pending)
+        if client_order_id and client_order_id in self._pending_cancel:
+            self._pending_cancel.discard(client_order_id)
+            state.state = "cancel_pending"
+            state.order_id = order_id
+            self._order_id_map[order_id] = (ticker, side)
+            self._client.cancel(order_id)
+            return
+        
         state.state = "resting"
         state.order_id = order_id
+        self._order_id_map[order_id] = (ticker, side)
     
     def on_order_rejected(self, ticker: str, side: str, error: str) -> None:
-        """Called when Kalshi rejects an order (market closed, etc.)."""
+        """Called when Kalshi rejects an order (market closed, etc.).
+        
+        Phase 1: called by PaperOrderClient (unused — paper never rejects).
+        Phase 2: called by order queue drainer on REST failure (order never
+                 reached Kalshi, safe to reset immediately).
+        """
         state = self._get_side_state(ticker, side)
         state.state = "idle"
         state.order_id = None
+        state.client_order_id = None
     
     def on_cancel_ack(self, ticker: str, side: str) -> None:
-        """Called when a cancel is confirmed."""
+        """Called when a cancel is confirmed.
+        
+        Phase 2: WS dispatcher looks up (ticker, side) from _order_id_map
+                 using the order_id in the user_orders status=canceled message.
+        """
         state = self._get_side_state(ticker, side)
+        if state.order_id:
+            self._order_id_map.pop(state.order_id, None)
         state.state = "idle"
         state.order_id = None
+        state.client_order_id = None
     
     def on_fill(self, ticker: str, side: str, fill_size: int,
                 remaining_size: int) -> None:
@@ -325,9 +457,36 @@ The strategy's in-memory positions can drift from Kalshi's actual state (missed 
 
 ```python
 async def _reconciliation_loop(self):
-    """Periodic truth-check against Kalshi's REST API."""
+    """Periodic truth-check against Kalshi's REST API.
+    
+    This is a safety net behind the WS push channels. In steady state it
+    should find zero mismatches. Any mismatch indicates a bug or a WS
+    delivery failure.
+    """
     while not self._shutdown.is_set():
         await asyncio.sleep(self._config.reconcile_interval_s)
+        now = time.time()
+        
+        # --- Stale pending/cancel_pending timeout ---
+        # If a state has been pending or cancel_pending for longer than
+        # PENDING_TIMEOUT_S, force-reset to idle. This prevents permanent
+        # lockout if a REST call hangs or a WS ACK is never delivered.
+        PENDING_TIMEOUT_S = 5.0
+        for ticker, sides in self._order_state.items():
+            for side_name, state in sides.items():
+                if state.state in ("pending", "cancel_pending"):
+                    if now - state.t_entered > PENDING_TIMEOUT_S:
+                        log.error("STALE %s on %s/%s for %.1fs — resetting",
+                                  state.state, ticker, side_name,
+                                  now - state.t_entered)
+                        # If it was pending, the order may have landed on
+                        # Kalshi — the orphan check below will catch it.
+                        if state.client_order_id:
+                            self._pending_cancel.add(state.client_order_id)
+                        state.state = "idle"
+                        state.order_id = None
+                        state.client_order_id = None
+        
         try:
             api_positions = await self._client.get_positions()
             api_orders = await self._client.get_open_orders()
@@ -343,10 +502,10 @@ async def _reconciliation_loop(self):
                 log.error("POSITION MISMATCH %s: internal=%d actual=%d",
                           ticker, internal, actual)
                 self._positions[ticker] = actual  # trust Kalshi
-                # Emit reconciliation event for the audit trail
                 await self._emit(MMReconcileEvent(...))
         
         # Diff open orders — detect orphaned orders from a prior crash
+        # or from stale pending resets above
         for order in api_orders:
             state = self._get_side_state(order.ticker, order.side)
             if state.order_id != order.order_id:
@@ -386,18 +545,25 @@ This is simpler than trying to resume mid-session: cancel everything, start clea
 
 ### 3. Order client: `app/clients/kalshi_rest_orders.py`
 
-Thin wrapper around Kalshi's REST API for order management. The existing `kalshi_sdk.py` uses the official SDK for market queries; this adds order placement.
+Thin wrapper around Kalshi's REST API for order placement and cancellation. Order lifecycle notifications (ACKs, fills) come from WS push channels, not REST responses — see "WS push channel wiring" below.
 
 ```python
 class KalshiOrderClient:
     """Place and cancel limit orders on Kalshi via REST.
     
-    Includes circuit breaker, auth retry, and callback-based ACK delivery.
+    Includes circuit breaker, auth retry. ACK/fill delivery is handled
+    separately by the WS push channel dispatcher (fill + user_orders channels),
+    not by REST response callbacks.
     """
     
     async def place_limit(self, ticker: str, side: str, price_cents: int,
-                          size: int) -> str:
-        """Returns order_id. Raises on failure after retry."""
+                          size: int, client_order_id: str | None = None) -> None:
+        """Fire-and-forget placement. Does NOT return order_id — the confirmed
+        order_id arrives via the user_orders WS channel.
+        
+        client_order_id is a caller-generated UUID used to correlate the REST
+        request with the WS ACK (user_orders message includes client_order_id).
+        """
         ...
     
     async def cancel(self, order_id: str) -> None: ...
@@ -407,13 +573,18 @@ class KalshiOrderClient:
         ...
     
     async def get_positions(self) -> dict[str, int]:
-        """Fetch current positions from Kalshi (source of truth)."""
+        """Fetch current positions from Kalshi (source of truth).
+        Used only at startup (bootstrap) and as a fallback reconciliation."""
         ...
     
     async def get_open_orders(self) -> list[OpenOrder]:
-        """Fetch all resting orders. Used for reconciliation and crash recovery."""
+        """Fetch all resting orders. Used for crash recovery (bootstrap)."""
         ...
 ```
+
+**Why REST for placement, WS for ACKs:** Kalshi's WS API is read-only — there is no WS order submission. We submit via REST but do NOT use the REST response to drive state transitions. Instead, the `user_orders` WS channel pushes authoritative order state changes (resting, canceled, executed) and the `fill` channel pushes fill notifications. This avoids the race where a REST response arrives before/after a WS fill notification for the same order.
+
+**`client_order_id` correlation:** When placing an order, we generate a UUID `client_order_id` and store it in the pending state. The `user_orders` WS message includes `client_order_id`, allowing us to correlate the ACK with the original intent even before we know the Kalshi-assigned `order_id`. This is critical for the `pending → resting` transition.
 
 #### Circuit breaker
 
@@ -451,31 +622,197 @@ When the circuit breaker opens:
 3. An `MMCircuitBreakerEvent` is emitted to silver for the audit trail
 4. The reconciliation loop keeps running — when it succeeds, the breaker resets
 
-#### Queue drainer with ACK callbacks
+### 4. WS push channel wiring
 
-The order queue sits between the synchronous `on_event()` and the async REST API. The drainer processes intents one at a time and calls back into the strategy to advance the state machine:
+In Phase 2, order lifecycle is driven by WS push channels, not REST response callbacks. The ingester subscribes to four private channels in addition to the existing public channels:
+
+```python
+# Channel subscriptions (Phase 2)
+PUBLIC_CHANNELS = ["orderbook_delta", "trade"]            # existing
+PRIVATE_CHANNELS = ["fill", "user_orders",                # order lifecycle
+                    "market_lifecycle_v2", "market_positions"]  # market state
+```
+
+#### Dispatching private channel messages
+
+The dispatcher uses the strategy's correlation maps (`_client_order_map`, `_order_id_map`) to translate between Kalshi's order identifiers and the strategy's `(ticker, side)` state machine keys.
+
+```python
+async def _dispatch_private(self, frame: dict) -> None:
+    """Route private WS channel messages to strategy callbacks."""
+    msg_type = frame.get("type")
+    msg = frame.get("msg", {})
+    
+    if msg_type == "fill":
+        # Authoritative fill notification from Kalshi.
+        # Look up (ticker, side) from the order_id.
+        order_id = msg["order_id"]
+        loc = self._strategy._order_id_map.get(order_id)
+        if loc is None:
+            log.warning("fill for unknown order_id %s — skipping", order_id)
+            return
+        ticker, side = loc
+        
+        # The strategy only posts YES-side orders:
+        #   "bid" = buy YES,  fill action="buy"
+        #   "ask" = sell YES, fill action="sell"
+        # Assert this assumption to catch misconfigurations.
+        expected_action = "buy" if side == "bid" else "sell"
+        assert msg["action"] == expected_action, (
+            f"fill action mismatch: expected {expected_action}, "
+            f"got {msg['action']} for {ticker} {side}")
+        
+        self._strategy.on_ws_fill(
+            ticker=ticker,
+            side=side,
+            order_id=order_id,
+            count=_fp_to_int(msg["count_fp"]),
+            price_cents=_dollars_to_cents(msg["yes_price_dollars"]),
+            fee_cents=_dollars_to_cents(msg["fee_cost"]),
+            is_taker=msg["is_taker"],
+            post_position=_fp_to_int(msg["post_position_fp"]),
+            t_ms=msg["ts_ms"],
+        )
+    
+    elif msg_type == "user_order":
+        status = msg["status"]
+        order_id = msg["order_id"]
+        client_order_id = msg.get("client_order_id")
+        
+        if status == "resting":
+            # Look up (ticker, side) from client_order_id
+            loc = self._strategy._client_order_map.pop(client_order_id, None)
+            if loc is None:
+                log.warning("ACK for unknown client_order_id %s", client_order_id)
+                return
+            ticker, side = loc
+            self._strategy.on_order_ack(ticker, side, order_id,
+                                        client_order_id=client_order_id)
+        
+        elif status == "canceled":
+            loc = self._strategy._order_id_map.get(order_id)
+            if loc is None:
+                log.warning("cancel ACK for unknown order_id %s", order_id)
+                return
+            ticker, side = loc
+            self._strategy.on_cancel_ack(ticker, side)
+        
+        elif status == "executed":
+            pass  # fills arrive via the fill channel
+    
+    elif msg_type == "market_lifecycle_v2":
+        event_type = msg["event_type"]
+        ticker = msg["market_ticker"]
+        # Only act on KXNBAPTS tickers we're quoting
+        if not ticker.startswith(self._strategy._config.series_filter):
+            return
+        if event_type in ("deactivated", "determined", "settled"):
+            self._strategy.on_market_close(ticker, event_type)
+    
+    elif msg_type == "market_position":
+        ticker = msg["market_ticker"]
+        position = _fp_to_int(msg["position_fp"])
+        self._strategy.on_position_update(ticker, position)
+```
+
+#### Strategy callbacks for WS push (Phase 2 additions)
+
+```python
+class MMStrategy:
+    def on_ws_fill(self, ticker: str, side: str, order_id: str,
+                   count: int, price_cents: int, fee_cents: int,
+                   is_taker: bool, post_position: int, t_ms: int) -> None:
+        """Called by WS fill channel. Authoritative — replaces check_fill().
+        
+        The dispatcher has already resolved (ticker, side) from _order_id_map.
+        """
+        state = self._get_side_state(ticker, side)
+        
+        # Update position from Kalshi's authoritative post_position
+        old_pos = self._positions.get(ticker, 0)
+        self._positions[ticker] = post_position
+        self._aggregate_position = sum(abs(v) for v in self._positions.values())
+        
+        # Track remaining size internally. The fill channel's count_fp tells
+        # us how many contracts filled in THIS event. We subtract from the
+        # order's remaining_size which we initialized at placement time.
+        # (The fill channel does not include a remaining field — we must
+        # track it ourselves from order_size - cumulative fills.)
+        state.remaining_size -= count
+        remaining = max(0, state.remaining_size)
+        
+        if remaining == 0:
+            self._order_id_map.pop(order_id, None)
+            state.state = "idle"
+            state.order_id = None
+            state.client_order_id = None
+        
+        # Emit MMFillEvent with authoritative fee and position data
+        self.pending_events.append(MMFillEvent(
+            t_receipt=t_ms / 1000.0,
+            market_ticker=ticker,
+            side="buy" if side == "bid" else "sell",
+            price=price_cents,
+            fill_size=count,
+            order_remaining_size=remaining,
+            position_before=old_pos,
+            position_after=post_position,
+            maker_fee=fee_cents,
+            order_id=order_id,
+        ))
+    
+    def on_market_close(self, ticker: str, event_type: str) -> None:
+        """Called when market_lifecycle_v2 signals deactivated/determined/settled."""
+        # Cancel all resting orders on this ticker
+        for side in ["bid", "ask"]:
+            state = self._get_side_state(ticker, side)
+            if state.state == "resting":
+                state.state = "cancel_pending"
+                self._client.cancel(state.order_id)
+        # If determined/settled and we have a position, log it
+        pos = self._positions.get(ticker, 0)
+        if pos != 0:
+            log.warning("POSITION AT %s: %s pos=%d", event_type, ticker, pos)
+    
+    def on_position_update(self, ticker: str, position: int) -> None:
+        """Called by market_positions channel. Sanity check only."""
+        internal = self._positions.get(ticker, 0)
+        if internal != position:
+            log.error("POSITION DRIFT %s: internal=%d kalshi=%d",
+                      ticker, internal, position)
+            self._positions[ticker] = position  # trust Kalshi
+            self._aggregate_position = sum(abs(v) for v in self._positions.values())
+```
+
+#### Order queue drainer (Phase 2)
+
+The queue drainer is simpler than in the original design because it no longer delivers ACKs — those arrive via `user_orders`. The drainer only fires REST calls and logs the intent:
 
 ```python
 async def _order_queue_drainer(self):
-    """Background task: drain order intents, call REST, deliver ACKs."""
+    """Background task: drain order intents, call REST API."""
     while True:
         intent = await self._order_queue.get()
         try:
             if intent.action == "place":
-                order_id = await self._client.place_limit(
-                    intent.ticker, intent.side, intent.price, intent.size)
-                self._strategy.on_order_ack(intent.ticker, intent.side, order_id)
+                await self._client.place_limit(
+                    intent.ticker, intent.side, intent.price, intent.size,
+                    client_order_id=intent.client_order_id)
+                # ACK arrives via user_orders WS channel — do NOT call
+                # on_order_ack() here
             elif intent.action == "cancel":
                 await self._client.cancel(intent.order_id)
-                self._strategy.on_cancel_ack(intent.ticker, intent.side)
+                # Cancel confirmation arrives via user_orders WS channel
         except Exception as e:
-            self._strategy.on_order_rejected(intent.ticker, intent.side, str(e))
+            # REST failure — the order never reached Kalshi, so we can
+            # safely transition back to idle
+            self._strategy.on_order_rejected(
+                intent.ticker, intent.side, str(e))
         finally:
-            # Emit MMOrderEvent regardless of success/failure
             await self._silver.emit(MMOrderEvent(...))
 ```
 
-Key design choice: **order placement is async and fire-and-forget from the strategy's perspective.** The strategy pushes order intents onto an `asyncio.Queue`; the drainer calls the REST API and delivers ACKs back to the strategy's state machine. This keeps `on_event()` non-blocking per `data-flow.md` rules while ensuring the state machine transitions are driven by real API responses.
+Key design choice: **order placement is async and fire-and-forget from the strategy's perspective.** The strategy pushes order intents onto an `asyncio.Queue`; the drainer calls the REST API. State transitions are driven by WS push channels (`user_orders` for ACKs, `fill` for fills), not REST responses. The only exception is REST *failure* — if the REST call throws, we know the order never reached Kalshi, so `on_order_rejected()` is safe to call immediately.
 
 ### 4. Event extensions: `app/events.py`
 
@@ -511,12 +848,13 @@ class MMQuoteEvent:
 class MMOrderEvent:
     """Every order placed or cancelled via the Kalshi REST API."""
     t_receipt: float
-    t_ack: float | None       # when Kalshi acknowledged (None if failed)
+    t_ack: float | None       # Phase 2: when user_orders WS ACK arrived (None if failed)
     market_ticker: str
     action: str               # "place_bid" | "place_ask" | "cancel" | "cancel_all"
     price: int | None
     size: int | None
     order_id: str | None
+    client_order_id: str | None  # Phase 2: correlates REST placement with WS ACK
     reason: str               # "spread_wide" | "quote_update" | "flatten" | "shutdown" | ...
     error: str | None         # None on success
 
@@ -612,55 +950,11 @@ the strategy decide, and what actually executed?"
 
 ### Strategy log events
 
-Extend `app/events.py` with three strategy-level events (beyond the two already proposed):
+The canonical event definitions are in the "Event extensions" section above. Key design choices:
 
-```python
-@dataclass(frozen=True)
-class MMOrderEvent:
-    """Every order placed or cancelled via the Kalshi REST API."""
-    t_receipt: float          # when we decided to place/cancel
-    t_ack: float | None       # when Kalshi acknowledged (None if failed/pending)
-    market_ticker: str
-    action: str               # "place_bid" | "place_ask" | "cancel" | "cancel_all"
-    price: int | None         # cents (None for cancel_all)
-    size: int | None
-    order_id: str | None      # Kalshi order ID (None if placement failed)
-    reason: str               # why: "spread_wide" | "position_limit" | "skew" |
-                              #      "flatten" | "shutdown" | "quote_update"
-    error: str | None         # None on success, error message on failure
-
-@dataclass(frozen=True)
-class MMQuoteEvent:
-    """Snapshot of the strategy's quoting decision on each book update."""
-    t_receipt: float
-    market_ticker: str
-    bid_price: int | None     # what we're posting (None = not quoting this side)
-    ask_price: int | None
-    book_bid: int             # what the market's best bid/ask is
-    book_ask: int
-    spread: int
-    position: int             # our net position on this ticker
-    reason_no_bid: str | None # why we're not bidding: "spread_narrow" | "pos_limit" | None
-    reason_no_ask: str | None
-
-@dataclass(frozen=True)
-class MMFillEvent:
-    """A confirmed fill on one of our resting orders."""
-    t_receipt: float
-    market_ticker: str
-    side: str                 # "buy" or "sell"
-    price: int                # cents
-    size: int
-    position_before: int
-    position_after: int
-    maker_fee: int            # cents
-    order_id: str
-    book_mid_at_fill: int     # for adverse selection measurement
-```
-
-Key design choices:
 - **`MMOrderEvent` logs every API call** including failures and the reason. This is the
   most important tape for debugging: "why did we place that order? why did it fail?"
+  In Phase 2, `t_ack` is populated from the `user_orders` WS timestamp to measure REST→ACK latency.
 - **`MMQuoteEvent` logs the decision, not just the action.** When we skip quoting, the
   `reason_no_bid` / `reason_no_ask` field says why. This is critical for debugging
   "why didn't we quote when the spread was wide?" scenarios.
@@ -886,15 +1180,25 @@ Wire the transform and strategy into the live process, but replace `KalshiOrderC
 
 ### Phase 2: Live trading, minimum size
 
-Replace `PaperOrderClient` with `KalshiOrderClient`. Start with:
+Replace `PaperOrderClient` with `KalshiOrderClient`. Subscribe to private WS channels (`fill`, `user_orders`, `market_lifecycle_v2`, `market_positions`). Start with:
 - `order_size = 1` (one contract per side = $1 max exposure per fill)
 - `max_position = 5` per ticker
 - `min_spread_cents = 5` (extra conservative, only wide spreads)
 - Monitor via notebook querying silver `MMFillEvent` Parquet
 
+**Implementation:**
+1. Implement `app/clients/kalshi_rest_orders.py` (REST order placement + cancel)
+2. Add WS push channel subscriptions and `_dispatch_private()` in ingester
+3. Add `on_ws_fill()`, `on_market_close()`, `on_position_update()` to strategy
+4. Add `bootstrap()` for startup recovery (cancel orphans, seed positions from REST)
+5. Add circuit breaker for REST failures
+6. Wire `client_order_id` correlation between REST placement and `user_orders` ACK
+7. Add reconciliation loop (REST fallback, runs every 30s)
+8. Deploy with separate deployment doc (`docs/deploy-mm-live.md`)
+
 **Duration:** 1-2 weeks. Enough game days to get ~100 round trips.
 
-**Success criteria:** live fill prices match paper expectations, realized P&L positive, no API issues (rate limits, auth failures, stale quotes).
+**Success criteria:** live fill prices match paper expectations, realized P&L positive, no API issues (rate limits, auth failures, stale quotes), WS push channels deliver fills and ACKs reliably, position drift between internal and `market_positions` channel is zero.
 
 ### Phase 3: Scale up
 
@@ -911,21 +1215,31 @@ If KXNBAPTS is profitable, evaluate KXNBATOTAL (showed positive edge at $0.03+, 
 
 ## Files to create/modify
 
+### Phase 1 (done)
+
+| File | Status | Description |
+|---|---|---|
+| `app/transforms/kalshi_ws.py` | **Done** | Raw frame → typed event, conn_id-aware book invalidation |
+| `app/strategy/mm.py` | **Done** | Order state machine, quoting logic, paper fill simulation |
+| `app/strategy/__init__.py` | **Done** | Package init |
+| `app/events.py` | **Done** | `BookInvalidated`, `MMQuoteEvent`, `MMFillEvent`, `MMOrderEvent` |
+| `scripts/live/kalshi_ws/__main__.py` | **Done** | Wire transform + strategy + silver into main loop; pass `conn_id` to transform |
+| `tests/strategy/test_mm.py` | **Done** | Order state machine, quoting, position limits, skewing, fills |
+| `tests/integration/test_paper_e2e.py` | **Done** | Full pipeline with fixture frames, conn_id transitions |
+
+### Phase 2 (pending)
+
 | File | Action | Description |
 |---|---|---|
-| `app/transforms/kalshi_ws.py` | **Create** | Raw frame → typed event, conn_id-aware book invalidation |
-| `app/strategy/mm.py` | **Create** | Order state machine, reconciliation loop, quoting logic |
-| `app/strategy/__init__.py` | **Create** | Package init |
-| `app/clients/kalshi_rest_orders.py` | **Create** | Place/cancel with circuit breaker, auth retry, ACK callbacks |
-| `app/events.py` | **Modify** | Add `BookInvalidated`, `MMQuoteEvent`, `MMFillEvent`, `MMOrderEvent`, `MMReconcileEvent`, `MMCircuitBreakerEvent` |
-| `scripts/live/kalshi_ws/__main__.py` | **Modify** | Wire transform + strategy + silver into main loop; pass `conn_id` to transform |
-| `app/core/config.py` | **Modify** | Add `MMConfig` fields (from env/defaults) |
+| `app/clients/kalshi_rest_orders.py` | **Create** | Place/cancel with circuit breaker, auth retry, `client_order_id` correlation |
+| `app/strategy/mm.py` | **Modify** | Add `on_ws_fill()`, `on_market_close()`, `on_position_update()`, `bootstrap()`, reconciliation loop |
+| `app/events.py` | **Modify** | Add `MMReconcileEvent`, `MMCircuitBreakerEvent` |
+| `scripts/live/kalshi_ws/__main__.py` | **Modify** | Subscribe to private WS channels (`fill`, `user_orders`, `market_lifecycle_v2`, `market_positions`), add `_dispatch_private()`, add `bootstrap()` call |
+| `docs/deploy-mm-live.md` | **Create** | Phase 2 deployment doc with live trading procedures |
 | `scripts/replay/mm.py` | **Create** | Offline replay with fill-simulating `ReplayOrderClient` |
 | `scripts/replay/diff.py` | **Create** | Live-vs-replay divergence detector |
 | `notebooks/strategies/mm_postmortem.ipynb` | **Create** | Template notebook for session post-mortems |
-| `tests/transforms/test_kalshi_ws.py` | **Create** | Golden-file tests for transform incl. conn_id transitions |
-| `tests/strategy/test_mm.py` | **Create** | Order state machine transitions, reconciliation, partial fills |
-| `tests/strategy/test_state_machine.py` | **Create** | Exhaustive state machine transition tests |
+| `tests/strategy/test_mm_live.py` | **Create** | WS push channel dispatch, `client_order_id` correlation, circuit breaker |
 | `tests/replay/test_determinism.py` | **Create** | Replay same session twice, assert identical output |
 
 ## Resolved issues (from quant dev review)
@@ -934,15 +1248,18 @@ Issues identified by engineering review and addressed in this version:
 
 | ID | Issue | Severity | Resolution |
 |---|---|---|---|
-| C1 | No order state reconciliation | Critical | 30s reconciliation loop against `get_positions()` + `get_open_orders()` |
+| C1 | No order state reconciliation | Critical | `market_positions` WS channel for continuous sanity check; REST `get_positions()` as fallback every 30s |
 | C2 | Ghost orders from fire-and-forget queue | Critical | Per-ticker order state machine (`idle→pending→resting→cancel_pending`) |
 | C3 | No crash recovery for in-flight orders | Critical | `bootstrap()` calls REST API on startup, cancels orphans |
 | C4 | Partial fills not modeled | Critical | `OrderSideState.remaining_size`, `MMFillEvent.fill_size` / `order_remaining_size` |
+| C5 | Fill detection from trade-stream inference | Critical | `fill` WS push channel provides authoritative fills with `order_id`, `fee_cost`, `post_position_fp` |
 | M1 | Replay structural divergence | Major | `ReplayOrderClient` simulates fills by matching resting orders against trade stream |
 | M2 | Book state lost on reconnect | Major | Transform tracks `conn_id`, emits `BookInvalidated`, strategy cancels stale orders |
 | M3 | REST down while WS up | Major | Circuit breaker after N consecutive REST failures, suppresses order intents |
 | M4 | Auth token expiry | Major | Re-sign and retry once on 401 in `_call()` |
 | M5 | No aggregate position limit | Major | `max_aggregate_position` in `MMConfig`, checked in `_on_book_update()` |
+| M6 | Game-end timing unknown | Major | `market_lifecycle_v2` WS channel pushes `deactivated`/`determined`/`settled` events |
+| M7 | ACK delivery tied to REST response | Major | `user_orders` WS channel pushes order state changes; `client_order_id` correlates placement with ACK |
 
 ## Open questions
 
@@ -950,10 +1267,14 @@ Issues identified by engineering review and addressed in this version:
 
 2. **Multi-game concurrency.** During a typical NBA night, 3-5 games overlap. Each game has ~20 KXNBAPTS markets. That's 60-100 markets to quote simultaneously. The single-connection WS handles the data; the question is whether the REST order API handles 100+ resting orders without latency issues.
 
-3. **Game-end timing.** Pre-settlement flattening needs to know when games end. Options: (a) subscribe to Kalshi's `market_lifecycle_v2` channel (cleanest — market close events), (b) NBA CDN scoreboard polling, (c) time heuristic (cancel all after 11 PM ET). Recommend (a) as Phase 3 work.
+3. ~~**Game-end timing.**~~ **Resolved.** Subscribe to `market_lifecycle_v2` WS channel. When `event_type` is `deactivated`, `determined`, or `settled`, cancel all resting orders and stop quoting that ticker. This is cleaner than NBA CDN polling or time heuristics — Kalshi tells us exactly when the market closes. Implemented in Phase 2 via `on_market_close()`.
 
 4. **Strategy isolation.** The strategy runs in-process per `data-flow.md`. A strategy bug could crash the ingester, losing bronze data. Mitigation: `on_event()` wrapped in try/except, strategy exceptions log but don't propagate. The order queue drainer is similarly protected. If this proves insufficient, extract to a sidecar process communicating via unix socket.
 
 5. **Strategy log volume.** `MMQuoteEvent` only emitted when the quoting decision *changes* (new price, start/stop quoting), not on every book update. Rate-limited to 1 per ticker per second for unchanged states. `SilverWriter` buffer gets a high-water mark that triggers early flush if rows exceed 100k.
 
-6. **Fill notification source.** Kalshi REST API provides fill notifications (polling `get_fills()`). Use this as source of truth for `on_fill()` callbacks, not trade-stream inference. The reconciliation loop already polls positions; extend it to poll recent fills.
+6. ~~**Fill notification source.**~~ **Resolved.** Use Kalshi's `fill` WS push channel as the authoritative source of fill notifications. The `fill` message includes `order_id`, `count_fp`, `fee_cost`, `post_position_fp`, and `is_taker` — everything we need. No trade-stream inference, no REST polling for fills. The `market_positions` channel provides a continuous sanity check on our position tracking. REST `get_positions()` / `get_open_orders()` are used only at startup (bootstrap) and as a fallback if WS channels go silent.
+
+7. **WS channel subscription timing.** Private channels (`fill`, `user_orders`, `market_positions`) require authentication. The current ingester authenticates at connection time. Verify that subscribing to private channels on the same connection as public channels works, or whether Kalshi requires separate connections for public vs private channels. If separate, the ingester opens two WS connections (adds complexity but no new process).
+
+8. **Multivariate market risk.** KXNBAPTS markets with different thresholds for the same player/game are related — if "LeBron over 25.5" moves, "LeBron over 30.5" moves too. The `multivariate_lookup` channel maps these relationships. Future work: use this to cap aggregate exposure across correlated markets, not just per-ticker.
