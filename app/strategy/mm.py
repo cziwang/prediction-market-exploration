@@ -304,10 +304,15 @@ class MMStrategy:
         ticker = event.market_ticker
         for side in ("bid", "ask"):
             state = self._get_side(ticker, side)
-            if state.state in ("resting", "pending"):
+            if state.state == "resting":
                 self._client.cancel(
                     ticker, side, state.order_id or "", event.t_receipt,
                 )
+            elif state.state == "pending":
+                # No order resting yet — just reset to idle
+                state.state = "idle"
+                state.order_id = None
+                state.price = None
         self._last_quote.pop(ticker, None)
 
     def _maybe_update_side(

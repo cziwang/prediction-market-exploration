@@ -1,7 +1,7 @@
 """Tests for app.strategy.mm."""
 
 from app.events import BookInvalidated, MMFillEvent, MMQuoteEvent, OrderBookUpdate, TradeEvent
-from app.strategy.mm import MMConfig, MMStrategy, PaperOrderClient
+from app.strategy.mm import MMConfig, MMStrategy, PaperOrderClient, maker_fee_cents
 
 
 def _make_strategy(**config_overrides) -> tuple[MMStrategy, PaperOrderClient]:
@@ -189,3 +189,56 @@ class TestQuoteEvents:
         s.on_event(_book_update("KXNBAPTS-TEST", 45, 50, t=2.0))
         n2 = len([e for e in s.pending_events if isinstance(e, MMQuoteEvent)])
         assert n2 == n  # no new quote event
+
+
+class TestMakerFee:
+    def test_fee_at_midrange(self):
+        # price=50: 0.0175 * 50 * 50 / 100 = 0.4375 → 0 → clamped to 1
+        # Actually: 0.0175 * 50 * 50 / 100 = 43.75 / 100 = 0.4375
+        # Wait: maker_fee_cents(50) = max(1, int(0.0175 * 50 * 50 / 100))
+        # = max(1, int(43.75)) = max(1, 43) ... no.
+        # 0.0175 * 50 * (100-50) / 100 = 0.0175 * 50 * 50 / 100 = 43.75
+        # int(43.75) = 43? No: 0.0175 * 50 * 50 = 43.75, / 100 = 0.4375
+        # int(0.4375) = 0, max(1, 0) = 1
+        # Hmm, let me recompute. price_cents=50:
+        # 0.0175 * 50 * (100-50) / 100 = 0.0175 * 50 * 50 / 100 = 0.0175 * 2500 / 100 = 43.75 / 100 = 0.4375
+        # int(0.4375) = 0, max(1,0) = 1
+        assert maker_fee_cents(50) == 1
+
+    def test_fee_at_extreme_low(self):
+        # price=1: 0.0175 * 1 * 99 / 100 = 1.7325 / 100 = 0.017325 → int=0 → 1
+        assert maker_fee_cents(1) == 1
+
+    def test_fee_at_extreme_high(self):
+        # price=99: same as price=1 (symmetric)
+        assert maker_fee_cents(99) == 1
+
+    def test_fee_at_25(self):
+        # price=25: 0.0175 * 25 * 75 / 100 = 32.8125 / 100 = 0.328125 → 0 → 1
+        assert maker_fee_cents(25) == 1
+
+    def test_fee_symmetry(self):
+        # fee(p) == fee(100-p) by the C*(1-C) formula
+        for p in range(1, 100):
+            assert maker_fee_cents(p) == maker_fee_cents(100 - p)
+
+
+class TestBookInvalidatedPending:
+    def test_pending_state_resets_to_idle_without_cancel(self):
+        """When a book is invalidated while an order is pending (no ACK yet),
+        we should reset to idle directly — not try to cancel a non-existent order."""
+        s, c = _make_strategy(min_spread_cents=3)
+        # Manually set bid to pending (simulating: place sent, ACK not yet received)
+        bid_state = s._get_side("KXNBAPTS-TEST", "bid")
+        bid_state.state = "pending"
+        bid_state.order_id = None  # no ACK yet
+        bid_state.price = 45
+
+        s.on_event(BookInvalidated(t_receipt=2.0, market_ticker="KXNBAPTS-TEST"))
+
+        assert bid_state.state == "idle"
+        assert bid_state.order_id is None
+        assert bid_state.price is None
+        # No cancel should have been issued for the pending order
+        cancels = [o for o in c.order_log if o["action"] == "cancel"]
+        assert len(cancels) == 0
