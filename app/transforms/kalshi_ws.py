@@ -159,16 +159,16 @@ class KalshiTransform:
             ticker = msg.get("market_ticker")
             if not ticker:
                 return events
-            yes_price = msg.get("yes_price")
-            count = msg.get("count")
+            yes_price = msg.get("yes_price_dollars")
+            count_fp = msg.get("count_fp")
             taker_side = msg.get("taker_side")
-            if yes_price is not None and count is not None and taker_side:
+            if yes_price is not None and count_fp is not None and taker_side:
                 events.append(TradeEvent(
                     t_receipt=t_receipt,
                     market_ticker=ticker,
                     side=taker_side,
                     price=_dollars_to_cents(str(yes_price)),
-                    size=int(count),
+                    size=int(round(float(count_fp))),
                 ))
 
         return events

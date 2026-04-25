@@ -32,8 +32,8 @@ def _trade_frame(ticker: str, yes_price: str, count: int, taker_side: str) -> di
         "type": "trade",
         "msg": {
             "market_ticker": ticker,
-            "yes_price": yes_price,
-            "count": count,
+            "yes_price_dollars": yes_price,
+            "count_fp": str(count),
             "taker_side": taker_side,
         },
     }

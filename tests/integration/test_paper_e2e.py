@@ -42,8 +42,8 @@ def _build_fixture_frames():
         "type": "trade",
         "msg": {
             "market_ticker": TICKER,
-            "yes_price": "0.4100",
-            "count": 1,
+            "yes_price_dollars": "0.4100",
+            "count_fp": "1.00",
             "taker_side": "no",
         },
     }))
@@ -53,8 +53,8 @@ def _build_fixture_frames():
         "type": "trade",
         "msg": {
             "market_ticker": TICKER,
-            "yes_price": "0.4500",
-            "count": 1,
+            "yes_price_dollars": "0.4500",
+            "count_fp": "1.00",
             "taker_side": "yes",
         },
     }))
