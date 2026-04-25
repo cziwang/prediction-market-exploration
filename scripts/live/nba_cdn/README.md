@@ -2,7 +2,8 @@
 
 Live NBA CDN ingester. Polls `cdn.nba.com` and archives every raw
 frame to `s3://prediction-markets-data/bronze/nba_cdn/` via
-`BronzeWriter`. No transform, no silver — bronze only.
+`BronzeWriter`. Currently bronze-only — no transform or silver
+pipeline yet (unlike the Kalshi WS ingester which has both).
 
 Entry point: `python -m scripts.live.nba_cdn` (runs `__main__.py`).
 Related docs:

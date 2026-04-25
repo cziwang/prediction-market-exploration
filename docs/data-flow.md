@@ -71,33 +71,31 @@ An earlier draft routed everything through a Kinesis Data Stream and wrote bronz
 
 If any of these mitigations stops holding — e.g., a second independent consumer becomes real, or the strategy needs restart-independent bronze writes — revisit Kinesis.
 
-## Proposed layout
+## Layout
 
 ```
 app/
 ├── clients/                    # raw I/O, per-source
-│   ├── nba_cdn.py                # NBA CDN REST (existing)
-│   ├── kalshi_sdk.py             # Kalshi REST (existing)
-│   └── kalshi_ws.py              # NEW — Kalshi WebSocket subscriber
+│   ├── nba_cdn.py                # NBA CDN REST
+│   ├── kalshi_sdk.py             # Kalshi REST via official SDK
+│   ├── kalshi_rest.py            # Kalshi historical REST via raw HTTP
+│   └── kalshi_rest_orders.py     # (Phase 2, planned) REST order placement
 ├── services/
-│   ├── s3_raw.py                 # existing — one-shot JSON puts for batch fetchers
-│   ├── bronze_writer.py          # NEW — async batched gzip-JSONL writer
-│   └── silver_writer.py          # NEW — async batched Parquet writer
+│   ├── s3_raw.py                 # one-shot JSON puts for batch fetchers
+│   ├── bronze_writer.py          # async batched gzip-JSONL writer
+│   └── silver_writer.py          # async batched Parquet writer
 ├── transforms/                 # pure raw → typed
 │   ├── __init__.py
-│   ├── nba_pbp.py                # NBA action dict → ScoreEvent | PeriodChange | …
 │   └── kalshi_ws.py              # WS frame → OrderBookUpdate | TradeEvent | …
 ├── events.py                   # frozen dataclasses for every domain event
 └── strategy/                   # consumes events.py; never touches raw JSON
-    └── …
+    └── mm.py                     # passive market maker on KXNBAPTS
 
 scripts/
-├── live/                         # NEW — live ingester+transformer+writer processes
-│   ├── kalshi_ws.py                # one process: Kalshi WS → bronze + strategy + silver
-│   └── nba_cdn.py                  # one process: NBA polling → bronze + strategy + silver
-└── materialize/                  # rebuild-only, run manually after transform changes
-    ├── nba_pbp.py
-    └── kalshi_ws.py
+├── live/                         # live ingester+transformer+writer processes
+│   ├── kalshi_ws/                  # Kalshi WS → bronze + transform + strategy + silver
+│   └── nba_cdn/                    # NBA polling → bronze (transform + silver planned)
+└── materialize/                  # (planned) rebuild silver from bronze after transform changes
 ```
 
 One live process per source, so a Kalshi WS reconnect storm doesn't force an NBA poller restart and vice versa. They share `BronzeWriter`, `SilverWriter`, and strategy state wiring from `app/`.
@@ -359,11 +357,11 @@ Catches the non-determinism class of bugs that would break backtest parity.
 
 1. **Silver flush cadence.** 5 min feels right for notebook freshness; too short creates lots of tiny Parquet files (bad for Athena later). Compaction can come later.
 2. **Bronze file sizing.** 5 MB / 60 s gives ~hundreds of KB gzipped — fine for ad-hoc re-reads, smallish for bulk scans. Revisit if bronze replay becomes a hotspot.
-3. **Process supervision.** For now, run under `systemd` / `tmux` / a laptop terminal. If uptime matters, introduce a supervisor or run on ECS/Fargate.
-4. **NBA migration.** Current NBA poller writes local JSONL → S3 on game end. Migrating it to `scripts/live/nba_cdn.py` + `BronzeWriter` changes the bronze layout notebooks depend on. Defer until after Kalshi WS is live.
-5. **Subscription scope for Kalshi.** Currently covers `orderbook_delta` + `trade` across `KXNBAGAME`, `KXNBASPREAD`, `KXNBATOTAL`, and `KXNBAPTS`. Remaining player-prop series (`KXNBAREB`, `KXNBAAST`, `KXNBA3PT`, `KXNBABLK`, `KXNBASTL`) and the rarer channels (`ticker`, `market_lifecycle_v2`) are deliberately excluded until we see whether one WS connection handles the current ~500 markets comfortably.
+3. ~~**Process supervision.**~~ **Resolved.** Both ingesters run under systemd on EC2. See [`docs/live-kalshi-ws-service.md`](live-kalshi-ws-service.md) and [`docs/live-nba-cdn-service.md`](live-nba-cdn-service.md).
+4. ~~**NBA migration.**~~ **Resolved.** NBA poller migrated to `scripts/live/nba_cdn/` + `BronzeWriter`. Deployed as `nba-live.service`.
+5. **Subscription scope for Kalshi.** Currently covers `orderbook_delta` + `trade` across `KXNBAGAME`, `KXNBASPREAD`, `KXNBATOTAL`, and `KXNBAPTS`. Remaining player-prop series (`KXNBAREB`, `KXNBAAST`, `KXNBA3PT`, `KXNBABLK`, `KXNBASTL`) and the rarer channels (`ticker`, `market_lifecycle_v2`) are deliberately excluded until we see whether one WS connection handles the current ~500 markets comfortably. Phase 2 adds private channels (`fill`, `user_orders`, `market_lifecycle_v2`, `market_positions`) — see [`docs/strategy-kalshi-mm.md`](strategy-kalshi-mm.md).
 6. **Retroactive NBA corrections.** The poller detects them via periodic snapshot hashes but doesn't apply them. Does the transform re-emit corrected `ScoreEvent` with the same `action_number` but a new `t_receipt`? Consumers would treat `(game_id, action_number)` as an upsert key. Defer until observed.
 7. **Kalshi WS gap handling.** On a `seq` gap, resubscribe and consume the fresh snapshot. Transform resets `OrderBookState`, seeds from the snapshot. Standard pattern but worth implementing and testing with synthetic gaps.
-8. **Strategy checkpointing.** Bootstrap from silver on start, then resume from live. Events dropped during downtime are visible in bronze but not to the running strategy — acceptable for exploration; revisit if live trading goes real.
+8. ~~**Strategy checkpointing.**~~ **Resolved.** Phase 2 design uses `bootstrap()` to seed positions from Kalshi REST on startup, cancel orphan orders, then resume from live WS events. See [`docs/strategy-kalshi-mm.md`](strategy-kalshi-mm.md).
 9. **Schema versioning.** Additive-only changes to event dataclasses for now. Breaking changes go in a new `v=N/` silver partition. Revisit if a schema change can't be additive.
 10. **When to reintroduce Kinesis.** Triggers: a second independent consumer becomes real, the strategy must survive ingester restarts without dropping live events, or bronze replay latency (download + gunzip) becomes painful for development.

@@ -5,7 +5,10 @@ subscribes to `orderbook_delta` and `trade` for every currently-open
 market across the four NBA series `KXNBAGAME`, `KXNBASPREAD`,
 `KXNBATOTAL`, and `KXNBAPTS`, and archives each raw frame to
 `s3://prediction-markets-data/bronze/kalshi_ws/` via `BronzeWriter`.
-No transform, no silver — bronze only.
+When `MM_ENABLED=1`, frames also flow through `KalshiTransform` →
+`MMStrategy` (paper trading) → `SilverWriter` (typed events to
+Parquet). See [`docs/deploy-mm-paper.md`](../../../docs/deploy-mm-paper.md)
+for strategy activation and monitoring.
 
 Entry point: `python -m scripts.live.kalshi_ws` (runs `__main__.py`).
 Related docs:

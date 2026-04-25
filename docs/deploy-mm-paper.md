@@ -41,7 +41,7 @@ For Phase 1, these defaults are conservative. Override by modifying `MMConfig()`
 Edit the existing service unit to add `MM_ENABLED=1`:
 
 ```bash
-sudo systemctl edit kalshi-ws-ingester.service
+sudo systemctl edit kalshi-live.service
 ```
 
 Add a complete override block:
@@ -54,8 +54,8 @@ Environment=MM_ENABLED=1
 Then restart:
 
 ```bash
-sudo systemctl restart kalshi-ws-ingester.service
-journalctl -u kalshi-ws-ingester.service -f
+sudo systemctl restart kalshi-live.service
+journalctl -u kalshi-live.service -f
 ```
 
 You should see:
@@ -136,7 +136,7 @@ Traceback ...
 Watch the logs for quoting and fill activity:
 
 ```bash
-journalctl -u kalshi-ws-ingester.service -f | grep -E "(quote|fill|MM)"
+journalctl -u kalshi-live.service -f | grep -E "(quote|fill|MM)"
 ```
 
 Expected behavior:
@@ -169,11 +169,12 @@ Load and analyze in a notebook:
 
 ```python
 import pandas as pd, io, boto3
+from datetime import date
 
 s3 = boto3.client("s3")
 
 # List all fill Parquet parts for today
-prefix = "silver/kalshi_ws/MMFillEvent/date=2026-04-23/v=1/"
+prefix = f"silver/kalshi_ws/MMFillEvent/date={date.today()}/v=1/"
 keys = [o["Key"] for page in s3.get_paginator("list_objects_v2").paginate(
     Bucket="prediction-markets-data", Prefix=prefix) for o in page.get("Contents", [])]
 

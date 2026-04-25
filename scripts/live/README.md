@@ -12,9 +12,11 @@ ingester live next to the code.
 | `kalshi_ws/` | `api.elections.kalshi.com` | authenticated WebSocket | [`kalshi_ws/README.md`](kalshi_ws/README.md) | [`live-kalshi-ws-service.md`](../../docs/live-kalshi-ws-service.md) |
 
 Both run the same pattern: ingester loop → `bronze.emit()` →
-`BronzeWriter` → gzipped JSONL on S3. No transform, no silver yet —
-bronze only. A third ingester would drop in next to these without
-changing anything they already do.
+`BronzeWriter` → gzipped JSONL on S3. The Kalshi WS ingester also
+runs a transform + strategy + silver pipeline when `MM_ENABLED=1`
+(see [`docs/deploy-mm-paper.md`](../../docs/deploy-mm-paper.md)).
+The NBA CDN ingester is bronze-only for now. A third ingester would
+drop in next to these without changing anything they already do.
 
 ## Conventions shared across ingesters
 

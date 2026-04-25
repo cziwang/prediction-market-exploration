@@ -52,7 +52,7 @@ Override by modifying `MMConfig()` in `scripts/live/kalshi_ws/__main__.py::_main
 Edit the existing service unit:
 
 ```bash
-sudo systemctl edit kalshi-ws-ingester.service
+sudo systemctl edit kalshi-live.service
 ```
 
 Add the override:
@@ -66,8 +66,8 @@ Environment=MM_LIVE=1
 Then restart:
 
 ```bash
-sudo systemctl restart kalshi-ws-ingester.service
-journalctl -u kalshi-ws-ingester.service -f
+sudo systemctl restart kalshi-live.service
+journalctl -u kalshi-live.service -f
 ```
 
 You should see:
@@ -89,12 +89,12 @@ MM_ENABLED=1 MM_LIVE=1 python -m scripts.live.kalshi_ws
 
 ```bash
 # Option 1: disable strategy, keep ingester running
-sudo systemctl edit kalshi-ws-ingester.service
+sudo systemctl edit kalshi-live.service
 # Remove MM_ENABLED and MM_LIVE lines
-sudo systemctl restart kalshi-ws-ingester.service
+sudo systemctl restart kalshi-live.service
 
 # Option 2: stop everything
-sudo systemctl stop kalshi-ws-ingester.service
+sudo systemctl stop kalshi-live.service
 ```
 
 On deactivation, the shutdown handler:
@@ -144,7 +144,7 @@ ws.subscribe(channels=["market_positions"])     # our position updates only
 ### During a game
 
 ```bash
-journalctl -u kalshi-ws-ingester.service -f | grep -E "(quote|fill|order|MISMATCH|CIRCUIT|ORPHAN|bootstrap)"
+journalctl -u kalshi-live.service -f | grep -E "(quote|fill|order|MISMATCH|CIRCUIT|ORPHAN|bootstrap)"
 ```
 
 Expected log patterns:
@@ -174,17 +174,24 @@ INFO  strategy.mm: market close KXNBAPTS-... event_type=determined
 Same as Phase 1, but now with authoritative fill data:
 
 ```python
-# Load fills with real fees and positions
-fills = load_silver("MMFillEvent", date="2026-04-25")
+import pandas as pd, io, boto3
+from datetime import date
+
+s3 = boto3.client("s3")
+today = str(date.today())
+
+# List all fill Parquet parts for today
+prefix = f"silver/kalshi_ws/MMFillEvent/date={today}/v=1/"
+keys = [o["Key"] for page in s3.get_paginator("list_objects_v2").paginate(
+    Bucket="prediction-markets-data", Prefix=prefix) for o in page.get("Contents", [])]
+
+fills = pd.concat([pd.read_parquet(io.BytesIO(
+    s3.get_object(Bucket="prediction-markets-data", Key=k)["Body"].read()))
+    for k in keys], ignore_index=True)
 
 # Live fills include authoritative fee_cost from Kalshi
 # (not the estimated maker_fee_cents from paper mode)
 print(f"Total fees paid: ${fills['maker_fee'].sum() / 100:.2f}")
-
-# Position reconciliation events — any mismatches detected?
-reconcile = load_silver("MMReconcileEvent", date="2026-04-25")
-if len(reconcile) > 0:
-    print(f"WARNING: {len(reconcile)} position/order mismatches detected")
 ```
 
 ### Metrics to track
@@ -217,9 +224,9 @@ primary source of truth. Mismatches indicate a bug or a WS delivery failure.
 ## Rollback to paper mode
 
 ```bash
-sudo systemctl edit kalshi-ws-ingester.service
+sudo systemctl edit kalshi-live.service
 # Change MM_LIVE=1 to MM_LIVE=0 (or remove it)
-sudo systemctl restart kalshi-ws-ingester.service
+sudo systemctl restart kalshi-live.service
 ```
 
 The shutdown handler cancels all resting orders before exiting. On restart with

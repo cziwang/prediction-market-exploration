@@ -1,14 +1,16 @@
 # Running `scripts/live/kalshi_ws` as a systemd service
 
-Deployment guide for the Kalshi WebSocket bronze ingester
+Deployment guide for the Kalshi WebSocket ingester
 (`scripts/live/kalshi_ws/__main__.py`). Design lives in
 [`data-flow.md`](data-flow.md); the NBA-side counterpart is
 [`live-nba-cdn-service.md`](live-nba-cdn-service.md).
 
-The service writes directly to
+The service writes raw frames to
 `s3://prediction-markets-data/bronze/kalshi_ws/` via `BronzeWriter` —
 one S3 prefix per server-side message `type`
 (`orderbook_snapshot`, `orderbook_delta`, `subscribed`, `error`, ...).
+When `MM_ENABLED=1`, it also runs the transform + MM strategy + silver
+pipeline — see [`deploy-mm-paper.md`](deploy-mm-paper.md) for details.
 
 ## Prerequisites
 
@@ -73,7 +75,7 @@ then a stream of `bronze flush` lines every ~60 s:
 ```bash
 sudo tee /etc/systemd/system/kalshi-live.service > /dev/null <<'EOF'
 [Unit]
-Description=Kalshi Live Bronze Ingester (WebSocket → S3 bronze)
+Description=Kalshi Live Ingester (WebSocket → S3 bronze + transform + silver)
 After=network.target
 
 [Service]
