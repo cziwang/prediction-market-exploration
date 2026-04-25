@@ -6,4 +6,4 @@ load_dotenv()
 
 S3_BUCKET = os.getenv("S3_BUCKET", "prediction-markets-data")
 
-SILVER_VERSION = 1
+SILVER_VERSION = 2

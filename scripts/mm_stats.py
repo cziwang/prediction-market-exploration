@@ -19,6 +19,8 @@ from datetime import datetime, timezone
 import boto3
 import pandas as pd
 
+from app.core.config import SILVER_VERSION
+
 BUCKET = "prediction-markets-data"
 
 
@@ -26,12 +28,14 @@ def _load_silver(event_type: str, date: str | None = None) -> pd.DataFrame:
     s3 = boto3.client("s3")
     prefix = f"silver/kalshi_ws/{event_type}/"
     if date:
-        prefix += f"date={date}/"
+        prefix += f"date={date}/v={SILVER_VERSION}/"
     paginator = s3.get_paginator("list_objects_v2")
+    version_segment = f"/v={SILVER_VERSION}/"
     keys = [
         o["Key"]
         for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix)
         for o in page.get("Contents", [])
+        if version_segment in o["Key"]
     ]
     if not keys:
         return pd.DataFrame()
