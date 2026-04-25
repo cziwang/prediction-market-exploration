@@ -53,7 +53,7 @@ class MMConfig:
     use_player_skew: bool = True
     player_skew_cents_per_contract: int = 2
     # Minimum volume filter: don't quote until ticker has seen N trades
-    min_trades_to_quote: int = 20  # 0 = disabled
+    min_trades_to_quote: int = 5  # 0 = disabled
 
 
 def maker_fee_cents(price_cents: int) -> int:
