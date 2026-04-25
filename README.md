@@ -25,6 +25,17 @@ Two tracks running against the same S3 bucket.
 
 **Market making strategy** — passive MM on Kalshi KXNBAPTS player prop markets. Posts limit orders at best bid/ask when spreads are wide enough to cover fees. Phase 1 (paper trading) is deployed; Phase 2 (live trading with real orders) is designed and pending implementation. Full design in [`docs/strategy-kalshi-mm.md`](docs/strategy-kalshi-mm.md).
 
+**Inventory risk mitigations** — six features to prevent unhedged positions from accumulating and settling as coin flips:
+
+1. **Scaled per-ticker skew** — widen quotes proportional to position size, not a fixed 1c. The deeper the hole, the harder it is to dig deeper.
+2. **Position age skew** — the longer a position is held, the more aggressively quotes widen to close it. Creates increasing urgency as settlement approaches.
+3. **Absolute exposure soft limit** — when total exposure across all tickers hits a threshold, stop opening new positions. Only allow fills that close existing ones.
+4. **Player-level correlated skew** — track net position across all thresholds for the same player (e.g., LeBron 15+/20+/25+/30+). Per-ticker skew misses this correlation.
+5. **Volume filter** — don't quote on tickers until they've had enough trades to prove there's two-sided flow. Dead markets produce one-sided fills with no offsetting flow.
+6. **Offsetting on tight spreads** — when the spread compresses below the minimum edge, still allow the position-closing side to quote. Prevents positions from being stuck when markets tighten.
+
+Backtested via `notebooks/strategies/inventory_backtest.ipynb`. Max exposure dropped 63% vs baseline.
+
 The key property: `transform()` runs exactly once per event, and its output is simultaneously what the strategy sees live and what silver stores for backtests. Structural parity. Full design in [`docs/data-flow.md`](docs/data-flow.md).
 
 ### Data flow
@@ -106,7 +117,7 @@ python -m scripts.live.kalshi_ws                               # Kalshi WS → b
 MM_ENABLED=1 python -m scripts.live.kalshi_ws                  # with paper trading MM strategy
 
 # --- Tests ---
-python -m pytest tests/ -v                                     # all tests (32)
+python -m pytest tests/ -v                                     # all tests (68)
 ```
 
 For long-running deployment under `systemd`, see:

@@ -1203,30 +1203,39 @@ A backtest replaying historical silver data (`notebooks/strategies/inventory_bac
 
 **Backtest result:** Settled open losses improved from -83c to -124c while cutting max exposure from 143 to 85 and improving realized P&L from +430c to +478c.
 
+#### 6. Offsetting orders on tight spreads
+
+**Problem:** When a position drifts far from entry (e.g., sold at 50c, market now at 70/72), the spread may compress below `min_edge_cents`. The strategy stops quoting entirely, leaving the position stuck until settlement — a coin flip, not a spread trade.
+
+**Solution:** When the spread is too tight to profitably quote, exempt the *offsetting* side from the spread check. If short, the bid (buy back) is still allowed. If long, the ask (sell) is still allowed. Only the side that would *increase* exposure is blocked.
+
+**Backtest result:** Dangerous in isolation (-213c vs baseline) because the extra fills create new unhedged positions. But with all other inventory risk features active, it improved total P&L by +168c (+21%) and cut settled losses from -165c to -75c. The guardrails (player skew, age skew, abs limit, volume filter) prevent new bad positions from forming, so the extra fills go toward closing existing positions.
+
+**Implementation:** Always-on in production (no config flag) since all inventory risk features are enabled by default.
+
 #### Combined result
 
-With all five features enabled, the backtest showed:
+With all six features enabled, the backtest showed (with full settlement data):
 
 | Metric | Baseline | All combined |
 |--------|----------|-------------|
-| Total P&L | +347c ($3.47) | **+533c ($5.33)** |
-| Realized (round-trips) | +430c | +642c (+49%) |
-| Settled open positions | -83c | -109c |
-| Round-trips | 65 | 64 |
-| Win rate | 72% | 72% |
-| Max absolute exposure | 143 | **60 (-58%)** |
-| Settled W/L | 7/42 | 4/27 |
+| Total P&L | +1023c ($10.23) | **+963c ($9.63)** |
+| Realized (round-trips) | +968c | +1038c |
+| Settled open positions | +55c | -75c |
+| Round-trips | 96 | 77 |
+| Max absolute exposure | 177 | **66 (-63%)** |
 
-The features complement each other: volume filter keeps the strategy out of dead markets, age skew forces old positions to attract offsetting flow, player skew prevents correlated buildup, and the abs exposure limit acts as a backstop. Total P&L improved 54% while max exposure dropped 58%.
+The features complement each other: volume filter keeps the strategy out of dead markets, age skew forces old positions to attract offsetting flow, player skew prevents correlated buildup, the abs exposure limit acts as a backstop, and offsetting on tight spreads lets the strategy actively close positions even when spreads compress. Max exposure dropped 63% while maintaining comparable P&L.
 
 #### Skew application order
 
 All skew adjustments are additive and applied in this order:
-1. Per-ticker skew (scaled by position size)
-2. Position age skew
-3. Player-level correlated skew
-4. Aggregate directional skew (existing)
-5. Absolute exposure soft limit (can suppress sides)
+1. Spread check — exempt offsetting side when carrying inventory
+2. Per-ticker skew (scaled by position size)
+3. Position age skew
+4. Player-level correlated skew
+5. Aggregate directional skew (existing)
+6. Absolute exposure soft limit (can suppress sides)
 
 Position age and player positions are persisted to the state file so they survive strategy restarts.
 
