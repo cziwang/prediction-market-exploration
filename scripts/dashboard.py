@@ -17,6 +17,7 @@ import time
 from datetime import datetime, timezone
 
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 from scripts.dashboard.ws_client import DashboardState, KalshiWSClient
 from scripts.dashboard.trading import cancel_all_orders, cancel_order, flatten_position, place_order
@@ -107,6 +108,9 @@ def _compute_positions_df(state: DashboardState) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def main():
+    # Silent auto-refresh every 2s — no spinner, no Stop button
+    st_autorefresh(interval=2000, limit=None, key="refresh")
+
     state = _get_state()
     client = _get_client()
 
@@ -266,9 +270,6 @@ def main():
             except Exception as e:
                 st.error(f"Order failed: {e}")
 
-    # Auto-refresh every 2 seconds
-    time.sleep(2)
-    st.rerun()
 
 
 if __name__ == "__main__":
