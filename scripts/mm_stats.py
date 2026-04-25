@@ -188,27 +188,34 @@ def cmd_positions() -> None:
         print(f"  {pos:+3d}  {ticker}")
 
 
-def _lookup_settlements(tickers: list[str]) -> dict[str, str | None]:
-    """Look up settlement results for a list of market tickers via Kalshi API.
+def _lookup_markets(tickers: list[str]) -> dict[str, dict]:
+    """Look up settlement result and current yes_bid/yes_ask for each ticker.
 
-    Returns {ticker: "yes" | "no" | None} where None means not yet settled.
+    Returns {ticker: {"result": "yes"|"no"|None, "yes_bid": int|None, "yes_ask": int|None}}.
     """
     import requests
 
-    results: dict[str, str | None] = {}
+    results: dict[str, dict] = {}
     for i, ticker in enumerate(tickers, 1):
         if i % 10 == 0 or i == len(tickers):
-            print(f"  Looking up settlements... {i}/{len(tickers)}", end="\r")
+            print(f"  Looking up markets... {i}/{len(tickers)}", end="\r")
         try:
             resp = requests.get(
                 f"https://api.elections.kalshi.com/trade-api/v2/markets/{ticker}",
                 timeout=10,
             )
             resp.raise_for_status()
-            result = resp.json().get("market", {}).get("result")
-            results[ticker] = result if result in ("yes", "no") else None
+            m = resp.json().get("market", {})
+            result = m.get("result")
+            yes_bid = m.get("yes_bid")
+            yes_ask = m.get("yes_ask")
+            results[ticker] = {
+                "result": result if result in ("yes", "no") else None,
+                "yes_bid": int(yes_bid) if yes_bid is not None else None,
+                "yes_ask": int(yes_ask) if yes_ask is not None else None,
+            }
         except Exception:
-            results[ticker] = None
+            results[ticker] = {"result": None, "yes_bid": None, "yes_ask": None}
     if len(tickers) >= 10:
         print()
     return results
@@ -271,40 +278,49 @@ def cmd_exposure() -> None:
         print("No open positions.")
         return
 
-    # --- look up actual settlements ---
-    print(f"Looking up {len(open_tickers)} settlements from Kalshi API...")
-    settlements = _lookup_settlements(open_tickers)
+    # --- look up settlements + current prices ---
+    print(f"Looking up {len(open_tickers)} markets from Kalshi API...")
+    market_data = _lookup_markets(open_tickers)
 
     rows = []
     for ticker in open_tickers:
         info = unpaired_by_ticker[ticker]
         unpaired = info["unpaired"]
         pos = info["pos"]
-        settlement = settlements.get(ticker)
+        mkt = market_data.get(ticker, {})
+        settlement = mkt.get("result")
+        yes_bid = mkt.get("yes_bid")
+        yes_ask = mkt.get("yes_ask")
+        mid = ((yes_bid + yes_ask) // 2) if yes_bid is not None and yes_ask is not None else None
 
         if settlement is not None:
-            # Compute actual P&L per contract
             if pos > 0:
-                # long YES: if settled YES → +100-price, if NO → -price
                 if settlement == "yes":
                     pnl = ((100 - unpaired["price"]) - unpaired["maker_fee"]).sum()
                 else:
                     pnl = -(unpaired["price"] + unpaired["maker_fee"]).sum()
             else:
-                # short YES: if settled NO → +price, if YES → -(100-price)
                 if settlement == "no":
                     pnl = (unpaired["price"] - unpaired["maker_fee"]).sum()
                 else:
                     pnl = -(100 - unpaired["price"] + unpaired["maker_fee"]).sum()
             status = f"{'YES' if settlement == 'yes' else 'NO':>3s}"
         else:
-            pnl = None
+            # Mark-to-market: unrealized P&L based on current mid
+            if mid is not None:
+                if pos > 0:
+                    pnl = ((mid - unpaired["price"]) - unpaired["maker_fee"]).sum()
+                else:
+                    pnl = ((unpaired["price"] - mid) - unpaired["maker_fee"]).sum()
+            else:
+                pnl = None
             status = "  ?"
 
         rows.append({
             "ticker": ticker,
             "pos": pos,
             "avg_entry": info["avg_entry"],
+            "mid": mid,
             "fees": info["fees"],
             "settlement": settlement,
             "status": status,
@@ -313,8 +329,8 @@ def cmd_exposure() -> None:
 
     exp = pd.DataFrame(rows).sort_values("pnl", na_position="last")
 
-    settled = exp[exp["pnl"].notna()]
-    unsettled = exp[exp["pnl"].isna()]
+    settled = exp[exp["settlement"].notna()]
+    unsettled = exp[exp["settlement"].isna()]
     n_short = (exp["pos"] < 0).sum()
     n_long = (exp["pos"] > 0).sum()
 
@@ -323,12 +339,13 @@ def cmd_exposure() -> None:
     print(f"  Unsettled:  {len(unsettled)}")
     print()
 
-    print(f"{'Ticker':<55s}  {'Pos':>4s}  {'AvgPx':>5s}  {'Result':>6s}  {'P&L':>7s}")
-    print("-" * 85)
+    print(f"{'Ticker':<55s}  {'Pos':>4s}  {'Entry':>5s}  {'Mid':>5s}  {'Result':>6s}  {'P&L':>7s}")
+    print("-" * 92)
     for _, r in exp.iterrows():
         pnl_str = f"{r['pnl']:>+7.0f}c" if pd.notna(r["pnl"]) else "      ?"
+        mid_str = f"{r['mid']:>5.0f}c" if pd.notna(r.get("mid")) and r["mid"] is not None else "    ?"
         print(f"{r['ticker']:<55s}  {r['pos']:>+4d}  {r['avg_entry']:>5.0f}c  "
-              f"{r['status']:>6s}  {pnl_str}")
+              f"{mid_str}  {r['status']:>6s}  {pnl_str}")
 
     # --- summary ---
     print()
@@ -340,16 +357,33 @@ def cmd_exposure() -> None:
               f"[{settled_wins}W / {settled_losses}L]")
 
     if len(unsettled) > 0:
-        print(f"Unsettled:             {len(unsettled)} positions still open")
+        mtm = unsettled[unsettled["pnl"].notna()]
+        if len(mtm) > 0:
+            mtm_pnl = mtm["pnl"].sum()
+            mtm_wins = (mtm["pnl"] > 0).sum()
+            mtm_losses = (mtm["pnl"] <= 0).sum()
+            print(f"Unsettled mark-to-mkt: {mtm_pnl:+.0f}c (${mtm_pnl/100:+.2f})  "
+                  f"[{mtm_wins}W / {mtm_losses}L]  ({len(unsettled)} positions)")
+        else:
+            print(f"Unsettled:             {len(unsettled)} positions (no mid available)")
 
     print()
     print("--- TOTAL P&L ---")
     print(f"Realized (round-trips):  {realized_total:+.0f}c (${realized_total/100:+.2f})  "
           f"[{rt_count} trades]")
     if len(settled) > 0:
-        total = realized_total + settled_pnl
-        print(f"+ Settled open pos:      {settled_pnl:+.0f}c (${settled_pnl/100:+.2f})")
-        print(f"= Net P&L:               {total:+.0f}c (${total/100:+.2f})")
+        settled_pnl_val = settled_pnl
+        print(f"+ Settled open pos:      {settled_pnl_val:+.0f}c (${settled_pnl_val/100:+.2f})")
+    else:
+        settled_pnl_val = 0
+    unsettled_mtm = unsettled[unsettled["pnl"].notna()]
+    if len(unsettled_mtm) > 0:
+        mtm_val = unsettled_mtm["pnl"].sum()
+        print(f"+ Unsettled (mark-to-mkt): {mtm_val:+.0f}c (${mtm_val/100:+.2f})")
+        total = realized_total + settled_pnl_val + mtm_val
+    else:
+        total = realized_total + settled_pnl_val
+    print(f"= Est. total P&L:       {total:+.0f}c (${total/100:+.2f})")
 
 
 def cmd_status() -> None:
