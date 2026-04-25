@@ -56,7 +56,7 @@ class MMConfig:
     min_trades_to_quote: int = 20  # 0 = disabled
     # Queue-aware fill simulation: only fill when trade exceeds estimated queue ahead
     use_queue_model: bool = True
-    queue_ahead_cap: int = 4  # max contracts assumed ahead of us (caps raw book depth)
+    queue_ahead_cap: int = 2  # max contracts assumed ahead of us (caps raw book depth)
     # Dynamic order sizing
     use_dynamic_sizing: bool = False  # False = fixed order_size
     max_order_size: int = 2           # hard cap on contracts per order
