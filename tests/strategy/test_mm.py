@@ -1,11 +1,24 @@
 """Tests for app.strategy.mm."""
 
+import json
+
 from app.events import BookInvalidated, MMFillEvent, MMQuoteEvent, OrderBookUpdate, TradeEvent
 from app.strategy.mm import MMConfig, MMStrategy, PaperOrderClient, maker_fee_cents
 
 
+# Defaults that disable new inventory-risk features so legacy tests pass unchanged.
+_LEGACY_DEFAULTS = dict(
+    skew_cents_per_contract=0,
+    age_skew_interval_s=0.0,
+    abs_exposure_soft_limit=0,
+    use_player_skew=False,
+    min_trades_to_quote=0,
+)
+
+
 def _make_strategy(**config_overrides) -> tuple[MMStrategy, PaperOrderClient]:
-    config = MMConfig(**config_overrides)
+    merged = {**_LEGACY_DEFAULTS, **config_overrides}
+    config = MMConfig(**merged)
     strategy = MMStrategy(order_client=None, config=config)  # type: ignore[arg-type]
     client = PaperOrderClient(strategy)
     strategy._client = client
@@ -284,6 +297,184 @@ class TestAggregateSkew:
         assert len(ask_place) == 1 and ask_place[0]["price"] == 50
 
 
+class TestScaledSkew:
+    """Per-ticker skew scales with position size when skew_cents_per_contract > 0."""
+
+    def test_skew_scales_with_position(self):
+        s, c = _make_strategy(
+            min_spread_cents=3, skew_threshold=1, skew_cents_per_contract=2,
+        )
+        s._positions["KXNBAPTS-TEST"] = 3
+        s.on_event(_book_update("KXNBAPTS-TEST", 45, 50))
+        bid = [o for o in c.order_log if o["action"] == "place_bid"]
+        assert len(bid) == 1
+        assert bid[0]["price"] == 45 - 6  # 3 * 2c = 6c widening
+
+    def test_skew_short_scales(self):
+        s, c = _make_strategy(
+            min_spread_cents=3, skew_threshold=1, skew_cents_per_contract=3,
+        )
+        s._positions["KXNBAPTS-TEST"] = -2
+        s.on_event(_book_update("KXNBAPTS-TEST", 45, 50))
+        ask = [o for o in c.order_log if o["action"] == "place_ask"]
+        assert len(ask) == 1
+        assert ask[0]["price"] == 50 + 6  # 2 * 3c = 6c widening
+
+    def test_no_skew_below_threshold(self):
+        s, c = _make_strategy(
+            min_spread_cents=3, skew_threshold=3, skew_cents_per_contract=2,
+        )
+        s._positions["KXNBAPTS-TEST"] = 2  # below threshold
+        s.on_event(_book_update("KXNBAPTS-TEST", 45, 50))
+        bid = [o for o in c.order_log if o["action"] == "place_bid"]
+        assert bid[0]["price"] == 45  # no widening
+
+
+class TestPositionAge:
+    """Position age tracking and age-based skew."""
+
+    def test_age_recorded_on_first_fill(self):
+        s, c = _make_strategy(min_spread_cents=3, order_size=1)
+        s.on_event(_book_update("KXNBAPTS-TEST", 45, 50, t=10.0))
+        s.on_event(_trade("KXNBAPTS-TEST", 45, "no", t=10.0))
+        assert s._position_opened_at["KXNBAPTS-TEST"] == 10.0
+
+    def test_age_cleared_when_flat(self):
+        s, c = _make_strategy(min_spread_cents=3, order_size=1)
+        s.on_event(_book_update("KXNBAPTS-TEST", 45, 50, t=10.0))
+        s.on_event(_trade("KXNBAPTS-TEST", 45, "no", t=10.0))  # buy → pos=1
+        assert "KXNBAPTS-TEST" in s._position_opened_at
+        s.on_event(_book_update("KXNBAPTS-TEST", 45, 50, t=11.0))
+        s.on_event(_trade("KXNBAPTS-TEST", 50, "yes", t=11.0))  # sell → pos=0
+        assert "KXNBAPTS-TEST" not in s._position_opened_at
+
+    def test_age_skew_widens_over_time(self):
+        s, c = _make_strategy(
+            min_spread_cents=3, age_skew_interval_s=600.0,
+            age_skew_step_cents=2, max_age_skew_cents=10,
+        )
+        s._positions["KXNBAPTS-TEST"] = 1
+        s._position_opened_at["KXNBAPTS-TEST"] = 100.0
+        # 1200s later → 2 tiers → 4c widening
+        s.on_event(_book_update("KXNBAPTS-TEST", 45, 50, t=1300.0))
+        bid = [o for o in c.order_log if o["action"] == "place_bid"]
+        assert bid[0]["price"] == 45 - 4
+
+    def test_age_skew_capped(self):
+        s, c = _make_strategy(
+            min_spread_cents=3, age_skew_interval_s=60.0,
+            age_skew_step_cents=3, max_age_skew_cents=5,
+        )
+        s._positions["KXNBAPTS-TEST"] = -1
+        s._position_opened_at["KXNBAPTS-TEST"] = 0.0
+        # 600s / 60s = 10 tiers × 3c = 30c, but capped at 5c
+        s.on_event(_book_update("KXNBAPTS-TEST", 45, 50, t=600.0))
+        ask = [o for o in c.order_log if o["action"] == "place_ask"]
+        assert ask[0]["price"] == 50 + 5
+
+
+class TestAbsExposureSoftLimit:
+    """Absolute exposure soft limit suppresses new-exposure side."""
+
+    def test_suppresses_bid_when_long_at_limit(self):
+        s, c = _make_strategy(min_spread_cents=3, abs_exposure_soft_limit=5)
+        s._positions["KXNBAPTS-A"] = 3
+        s._positions["KXNBAPTS-B"] = 2
+        s._aggregate_abs_position = 5
+        s.on_event(_book_update("KXNBAPTS-A", 45, 50))
+        places = [o for o in c.order_log if o["action"].startswith("place")]
+        # Position is +3, so bid suppressed (would increase abs), ask allowed
+        assert len(places) == 1
+        assert places[0]["action"] == "place_ask"
+
+    def test_suppresses_ask_when_short_at_limit(self):
+        s, c = _make_strategy(min_spread_cents=3, abs_exposure_soft_limit=5)
+        s._positions["KXNBAPTS-A"] = -5
+        s._aggregate_abs_position = 5
+        s.on_event(_book_update("KXNBAPTS-A", 45, 50))
+        places = [o for o in c.order_log if o["action"].startswith("place")]
+        assert len(places) == 1
+        assert places[0]["action"] == "place_bid"
+
+    def test_suppresses_both_when_flat_at_limit(self):
+        s, c = _make_strategy(min_spread_cents=3, abs_exposure_soft_limit=5)
+        s._positions["KXNBAPTS-A"] = 3
+        s._positions["KXNBAPTS-B"] = -2
+        s._aggregate_abs_position = 5
+        # Flat on this ticker — both sides would increase abs exposure
+        s.on_event(_book_update("KXNBAPTS-C", 45, 50))
+        places = [o for o in c.order_log if o["action"].startswith("place")]
+        assert len(places) == 0
+
+    def test_disabled_when_zero(self):
+        s, c = _make_strategy(min_spread_cents=3, abs_exposure_soft_limit=0)
+        s._positions["KXNBAPTS-A"] = 100
+        s._aggregate_abs_position = 100
+        s.on_event(_book_update("KXNBAPTS-A", 45, 50))
+        places = [o for o in c.order_log if o["action"].startswith("place")]
+        assert len(places) >= 1  # not suppressed
+
+
+class TestPlayerSkew:
+    """Player-level correlated skew across thresholds."""
+
+    def test_player_position_tracked(self):
+        s, c = _make_strategy(
+            min_spread_cents=3, order_size=1, use_player_skew=True,
+            player_skew_cents_per_contract=1,
+        )
+        # First ticker: sell at ask
+        s.on_event(_book_update("KXNBAPTS-G-PLAYER1-10", 30, 70, t=1.0))
+        s.on_event(_trade("KXNBAPTS-G-PLAYER1-10", 70, "yes", t=1.0))  # sell
+        assert s._player_positions["PLAYER1"] == -1
+        # Second ticker: player skew widens ask by 1c (player_pos=-1),
+        # so ask is placed at 71. Trade at 71 fills it.
+        s.on_event(_book_update("KXNBAPTS-G-PLAYER1-20", 30, 70, t=2.0))
+        s.on_event(_trade("KXNBAPTS-G-PLAYER1-20", 71, "yes", t=2.0))  # sell
+        assert s._player_positions["PLAYER1"] == -2
+
+    def test_player_skew_widens_ask(self):
+        s, c = _make_strategy(
+            min_spread_cents=3, use_player_skew=True,
+            player_skew_cents_per_contract=2,
+        )
+        s._player_positions["PLAYER1"] = -3
+        s.on_event(_book_update("KXNBAPTS-G-PLAYER1-10", 45, 50))
+        ask = [o for o in c.order_log if o["action"] == "place_ask"]
+        assert ask[0]["price"] == 50 + 6  # 3 * 2c
+
+    def test_player_key_extraction(self):
+        assert MMStrategy._player_key("KXNBAPTS-26APR25DENMIN-DENCBRAUN0-10") == "DENCBRAUN0"
+        assert MMStrategy._player_key("KXNBAPTS-G-PLAYER1-20") == "PLAYER1"
+        assert MMStrategy._player_key("SHORT") is None
+
+
+class TestVolumeFilter:
+    """Minimum trade volume filter."""
+
+    def test_no_quote_before_min_trades(self):
+        s, c = _make_strategy(min_spread_cents=3, min_trades_to_quote=5)
+        s.on_event(_book_update("KXNBAPTS-TEST", 45, 50))
+        places = [o for o in c.order_log if o["action"].startswith("place")]
+        assert len(places) == 0
+
+    def test_quotes_after_min_trades(self):
+        s, c = _make_strategy(min_spread_cents=3, min_trades_to_quote=3)
+        # Send 3 trades to build up count
+        for i in range(3):
+            s.on_event(_trade("KXNBAPTS-TEST", 47, "yes", t=float(i)))
+        # Now should quote
+        s.on_event(_book_update("KXNBAPTS-TEST", 45, 50, t=10.0))
+        places = [o for o in c.order_log if o["action"].startswith("place")]
+        assert len(places) == 2
+
+    def test_disabled_when_zero(self):
+        s, c = _make_strategy(min_spread_cents=3, min_trades_to_quote=0)
+        s.on_event(_book_update("KXNBAPTS-TEST", 45, 50))
+        places = [o for o in c.order_log if o["action"].startswith("place")]
+        assert len(places) == 2
+
+
 class TestBookInvalidatedPending:
     def test_pending_state_resets_to_idle_without_cancel(self):
         """When a book is invalidated while an order is pending (no ACK yet),
@@ -303,3 +494,58 @@ class TestBookInvalidatedPending:
         # No cancel should have been issued for the pending order
         cancels = [o for o in c.order_log if o["action"] == "cancel"]
         assert len(cancels) == 0
+
+
+class TestPositionPersistence:
+    def _make_strategy_with_state(self, state_path, **config_overrides):
+        merged = {**_LEGACY_DEFAULTS, "state_path": state_path, **config_overrides}
+        config = MMConfig(**merged)
+        strategy = MMStrategy(order_client=None, config=config)  # type: ignore[arg-type]
+        client = PaperOrderClient(strategy)
+        strategy._client = client
+        return strategy, client
+
+    def test_state_written_on_fill(self, tmp_path):
+        sp = tmp_path / "state.json"
+        s, c = self._make_strategy_with_state(sp, min_spread_cents=3, order_size=1)
+        s.on_event(_book_update("KXNBAPTS-TEST", 45, 50))
+        s.on_event(_trade("KXNBAPTS-TEST", 45, "no"))
+        assert sp.exists()
+        data = json.loads(sp.read_text())
+        assert data["positions"] == {"KXNBAPTS-TEST": 1}
+        assert "KXNBAPTS-TEST" in data.get("position_opened_at", {})
+
+    def test_state_loaded_on_init(self, tmp_path):
+        sp = tmp_path / "state.json"
+        sp.write_text(json.dumps({"positions": {"KXNBAPTS-A": 3, "KXNBAPTS-B": -2}}))
+        s, c = self._make_strategy_with_state(sp)
+        assert s._positions == {"KXNBAPTS-A": 3, "KXNBAPTS-B": -2}
+        assert s._agg_net_position == 1
+        assert s._aggregate_abs_position == 5
+
+    def test_no_state_file_ok(self, tmp_path):
+        sp = tmp_path / "nonexistent.json"
+        s, c = self._make_strategy_with_state(sp)
+        assert s._positions == {}
+
+    def test_state_path_none_no_write(self, tmp_path):
+        s, c = _make_strategy(min_spread_cents=3, order_size=1)
+        s.on_event(_book_update("KXNBAPTS-TEST", 45, 50))
+        s.on_event(_trade("KXNBAPTS-TEST", 45, "no"))
+        # No state file should exist anywhere — strategy has state_path=None
+        assert s._config.state_path is None
+
+    def test_zero_positions_cleaned(self, tmp_path):
+        sp = tmp_path / "state.json"
+        s, c = self._make_strategy_with_state(sp, min_spread_cents=3, order_size=1)
+        # Buy then sell to get back to 0
+        s.on_event(_book_update("KXNBAPTS-TEST", 45, 50))
+        s.on_event(_trade("KXNBAPTS-TEST", 45, "no"))  # buy
+        assert s._positions["KXNBAPTS-TEST"] == 1
+        # Need to re-place ask order (it was filled above or idle)
+        s.on_event(_book_update("KXNBAPTS-TEST", 45, 50, t=3.0))
+        s.on_event(_trade("KXNBAPTS-TEST", 50, "yes", t=4.0))  # sell
+        assert s._positions["KXNBAPTS-TEST"] == 0
+        data = json.loads(sp.read_text())
+        assert data["positions"] == {}
+        assert data.get("position_opened_at", {}) == {}

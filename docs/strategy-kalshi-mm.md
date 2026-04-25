@@ -1144,14 +1144,91 @@ Binary contracts settle at $0 or $1 at game end. Open positions at settlement ar
 
 Implementation: the strategy needs game-end estimates. Source: NBA CDN scoreboard data (period + clock → estimated minutes remaining), or a simple heuristic (cancel all orders after 10 PM ET for that day's games).
 
-### Quote skewing
+### Inventory risk mitigations
 
-When inventory accumulates, skew quotes to attract the offsetting flow:
+Paper trading revealed that while the strategy captures spread on round-trips (~70% win rate), it accumulates **unhedged directional inventory** that settles as coin flips. On the first full day of trading, round-trip P&L was +$4.30 but settled open positions lost -$5.56, producing a net loss.
 
-- **Long 5 contracts**: widen the bid by 1c (less eager to buy more), keep the ask tight (attract sellers)
-- **Short 5 contracts**: keep the bid tight (attract buyers), widen the ask by 1c
+Root cause analysis showed three contributing factors:
+1. Positions held to settlement become directional bets (not spread trades)
+2. Low-volume tickers get one-sided fills with no offsetting flow
+3. Correlated exposure across thresholds for the same player amplifies risk
 
-This is a standard market-maker inventory management technique. The `skew_threshold` config controls when it kicks in.
+A backtest replaying historical silver data (`notebooks/strategies/inventory_backtest.ipynb`) evaluated five mitigations. All five are now implemented in `MMConfig` with optimal parameters found via parameter sweep.
+
+#### 1. Scaled per-ticker skew (`skew_cents_per_contract`)
+
+**Problem:** The original skew was fixed at 1c, only triggering at `|position| >= 3`. Most open positions were ±1 contract — skew never fired.
+
+**Solution:** Widen quotes by `|position| × skew_cents_per_contract` whenever `|position| >= skew_threshold`. With `skew_threshold=3, skew_cents_per_contract=1`, a position of -4 widens the ask by 4c. This creates progressively stronger incentive for offsetting flow as inventory grows.
+
+**Config:** `skew_threshold=3`, `skew_cents_per_contract=1` (0 = legacy fixed-1c behavior).
+
+#### 2. Position age skew (`age_skew_interval_s`)
+
+**Problem:** A position opened 2 hours ago was treated identically to one opened 2 minutes ago. Old positions are more likely to settle unhedged.
+
+**Solution:** Track when each position was first opened (`_position_opened_at` dict). Every `age_skew_interval_s` seconds the position is held, widen quotes by an additional `age_skew_step_cents`, up to `max_age_skew_cents`. This creates increasing urgency to close positions as they age.
+
+**Config:** `age_skew_interval_s=1800` (30 min tiers), `age_skew_step_cents=1`, `max_age_skew_cents=10`.
+
+**Backtest result:** Increased realized P&L from +430c to +618c (+44%) by forcing older positions to attract offsetting flow.
+
+#### 3. Absolute exposure soft limit (`abs_exposure_soft_limit`)
+
+**Problem:** The hard cap (`max_aggregate_position=200`) only suppresses all quoting at extreme levels. Below that, exposure grows unchecked.
+
+**Solution:** When `aggregate_abs_position >= abs_exposure_soft_limit`, only allow orders that **reduce** absolute exposure — i.e., suppress the side that would add to it. If long on a ticker, suppress bids; if short, suppress asks; if flat, suppress both (any fill would increase abs exposure).
+
+**Config:** `abs_exposure_soft_limit=150`.
+
+**Backtest result:** Capped max exposure at 101 vs 143 baseline while maintaining similar fill count.
+
+#### 4. Player-level correlated skew (`use_player_skew`)
+
+**Problem:** Multiple thresholds for the same player (e.g., LeBron 15+, 20+, 25+, 30+) are correlated. Being short -1 on each of four thresholds is effectively short -4 on the player, but per-ticker skew (which sees -1 each) doesn't trigger.
+
+**Solution:** Track `_player_positions[player_key]` as the net position across all thresholds for the same player. Apply additional skew of `|player_pos| × player_skew_cents_per_contract`. Player key is extracted from the ticker: `KXNBAPTS-GAME-PLAYER-THRESHOLD` → `PLAYER`.
+
+**Config:** `use_player_skew=True`, `player_skew_cents_per_contract=2`.
+
+**Backtest result:** Reduced max exposure from 143 to 97 and improved win rate on settled positions.
+
+#### 5. Minimum volume filter (`min_trades_to_quote`)
+
+**Problem:** Low-volume tickers are where one-sided fills happen most — the strategy gets filled on the sell side and offsetting buy flow never arrives, leaving a naked directional position.
+
+**Solution:** Track `_trade_counts[ticker]` (incremented on every `TradeEvent`). Don't quote on a ticker until it has seen at least `min_trades_to_quote` trades in the current session. This filters out dead markets where market-making produces only unhedged positions.
+
+**Config:** `min_trades_to_quote=20`.
+
+**Backtest result:** Settled open losses improved from -83c to -124c while cutting max exposure from 143 to 85 and improving realized P&L from +430c to +478c.
+
+#### Combined result
+
+With all five features enabled, the backtest showed:
+
+| Metric | Baseline | All combined |
+|--------|----------|-------------|
+| Total P&L | +347c ($3.47) | **+533c ($5.33)** |
+| Realized (round-trips) | +430c | +642c (+49%) |
+| Settled open positions | -83c | -109c |
+| Round-trips | 65 | 64 |
+| Win rate | 72% | 72% |
+| Max absolute exposure | 143 | **60 (-58%)** |
+| Settled W/L | 7/42 | 4/27 |
+
+The features complement each other: volume filter keeps the strategy out of dead markets, age skew forces old positions to attract offsetting flow, player skew prevents correlated buildup, and the abs exposure limit acts as a backstop. Total P&L improved 54% while max exposure dropped 58%.
+
+#### Skew application order
+
+All skew adjustments are additive and applied in this order:
+1. Per-ticker skew (scaled by position size)
+2. Position age skew
+3. Player-level correlated skew
+4. Aggregate directional skew (existing)
+5. Absolute exposure soft limit (can suppress sides)
+
+Position age and player positions are persisted to the state file so they survive strategy restarts.
 
 ### Kill switch
 

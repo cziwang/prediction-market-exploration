@@ -256,7 +256,7 @@ async def _main() -> None:
     # Phase 1: paper trading (set MM_ENABLED=1 to activate)
     mm_enabled = os.environ.get("MM_ENABLED", "0") == "1"
     if mm_enabled:
-        config = MMConfig()
+        config = MMConfig(state_path=Path("mm_state.json"))
         # Strategy and client are wired circularly
         strategy = MMStrategy(order_client=None, config=config)  # type: ignore[arg-type]
         client = PaperOrderClient(strategy)

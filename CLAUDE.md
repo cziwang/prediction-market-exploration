@@ -52,15 +52,16 @@ tests/
     └── test_paper_e2e.py      # Full pipeline with fixture frames, conn_id transitions
 notebooks/
 └── strategies/
-    ├── market_making.ipynb    # MM simulation + backtesting on historical data
-    ├── order_book.ipynb       # Order book analysis
-    └── cross_market_arb.ipynb # Cross-market arbitrage exploration
+    ├── market_making.ipynb       # MM simulation + backtesting on historical data
+    ├── inventory_backtest.ipynb   # Inventory risk feature backtest (replays silver data)
+    ├── volume_analysis.ipynb      # KXNBAPTS volume & liquidity analysis
+    ├── order_book.ipynb           # Order book analysis
+    └── cross_market_arb.ipynb     # Cross-market arbitrage exploration
 docs/
 ├── data-flow.md               # Live pipeline architecture (bronze/silver/transform/strategy)
 ├── strategy-kalshi-mm.md      # MM strategy design (Phase 1 + Phase 2 WS push channels)
 ├── deploy-mm-paper.md         # Phase 1 paper trading deployment
 ├── deploy-mm-live.md          # Phase 2 live trading deployment
-├── ec2-bootstrap.md           # EC2 instance setup
 ├── live-kalshi-ws-service.md  # Kalshi WS systemd service
 └── study-guide.md             # Self-paced study guide
 ```
@@ -122,6 +123,13 @@ The series list is defined in `scripts/kalshi/fetch_historical_markets.py::ALL_N
 - **YES-side orders only**: bid = buy YES, ask = sell YES. Simplifies Kalshi API mapping.
 - **Phase 1 (paper)**: `PaperOrderClient` simulates fills by matching public trade stream against resting orders. Instant ACKs.
 - **Phase 2 (live)**: `KalshiOrderClient` places via REST. Fills arrive via `fill` WS channel, ACKs via `user_orders` channel. `client_order_id` correlates REST placement with WS ACK. `market_lifecycle_v2` triggers stop-quoting on market close. `market_positions` provides continuous position sanity check.
+- **Inventory risk mitigations** (5 features, see `docs/strategy-kalshi-mm.md`):
+  - Scaled per-ticker skew (`skew_cents_per_contract=1`): widen by `|pos| × cents`, not fixed 1c
+  - Position age skew (`age_skew_interval_s=1800`): widen 1c per 30 min held, cap 10c
+  - Abs exposure soft limit (`abs_exposure_soft_limit=150`): only allow offsetting fills above this
+  - Player-level skew (`use_player_skew=True`, `player_skew_cents_per_contract=2`): track net position across thresholds for same player
+  - Volume filter (`min_trades_to_quote=20`): don't quote until ticker has 20+ observed trades
+  - Backtest result: +54% total P&L, -58% max exposure vs baseline. See `notebooks/strategies/inventory_backtest.ipynb`.
 
 ## Common commands
 
@@ -139,7 +147,12 @@ python -m scripts.live.kalshi_ws                                    # Kalshi WS 
 MM_ENABLED=1 python -m scripts.live.kalshi_ws                       # with paper trading strategy
 
 # Tests
-python -m pytest tests/ -v                                          # all tests (32)
+python -m pytest tests/ -v                                          # all tests (66)
+
+# Monitoring (EC2)
+python -m scripts.mm_stats                                          # paper trading dashboard
+python -m scripts.mm_stats exposure                                 # unrealized P&L with actual settlements
+tail -f /var/log/kalshi-live.log                                    # live service logs
 ```
 
 ## Data coverage

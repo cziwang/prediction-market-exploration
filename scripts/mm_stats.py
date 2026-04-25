@@ -6,6 +6,7 @@ Usage:
     python -m scripts.mm_stats fills        # fill details
     python -m scripts.mm_stats quotes       # quoting activity
     python -m scripts.mm_stats positions    # open inventory
+    python -m scripts.mm_stats exposure     # unrealized P&L + combined totals
     python -m scripts.mm_stats status       # is the strategy running?
 """
 
@@ -45,6 +46,17 @@ def _load_silver(event_type: str, date: str | None = None) -> pd.DataFrame:
         ],
         ignore_index=True,
     )
+
+
+def _true_position(g: pd.DataFrame) -> int:
+    """Compute true economic position from fill deltas, ignoring position resets."""
+    pos = 0
+    for _, r in g.iterrows():
+        if r["side"] == "buy":
+            pos += r["fill_size"]
+        else:
+            pos -= r["fill_size"]
+    return pos
 
 
 def cmd_pnl() -> None:
@@ -155,7 +167,9 @@ def cmd_positions() -> None:
         print("No fills — no positions.")
         return
 
-    open_pos = fills.groupby("market_ticker")["position_after"].last()
+    open_pos = fills.groupby("market_ticker").apply(
+        _true_position, include_groups=False,
+    )
     open_pos = open_pos[open_pos != 0]
 
     if open_pos.empty:
@@ -168,6 +182,170 @@ def cmd_positions() -> None:
     print()
     for ticker, pos in open_pos.sort_values().items():
         print(f"  {pos:+3d}  {ticker}")
+
+
+def _lookup_settlements(tickers: list[str]) -> dict[str, str | None]:
+    """Look up settlement results for a list of market tickers via Kalshi API.
+
+    Returns {ticker: "yes" | "no" | None} where None means not yet settled.
+    """
+    import requests
+
+    results: dict[str, str | None] = {}
+    for i, ticker in enumerate(tickers, 1):
+        if i % 10 == 0 or i == len(tickers):
+            print(f"  Looking up settlements... {i}/{len(tickers)}", end="\r")
+        try:
+            resp = requests.get(
+                f"https://api.elections.kalshi.com/trade-api/v2/markets/{ticker}",
+                timeout=10,
+            )
+            resp.raise_for_status()
+            result = resp.json().get("market", {}).get("result")
+            results[ticker] = result if result in ("yes", "no") else None
+        except Exception:
+            results[ticker] = None
+    if len(tickers) >= 10:
+        print()
+    return results
+
+
+def cmd_exposure() -> None:
+    """Unrealized P&L for open positions, using actual settlement results from Kalshi."""
+    fills = _load_silver("MMFillEvent")
+    if fills.empty:
+        print("No fills yet.")
+        return
+
+    # --- realized P&L (same logic as cmd_pnl) ---
+    realized_total = 0
+    realized_fees = 0
+    rt_count = 0
+    for _, g in fills.groupby("market_ticker"):
+        buys = g[g["side"] == "buy"].sort_values("t_receipt")
+        sells = g[g["side"] == "sell"].sort_values("t_receipt")
+        pairs = min(len(buys), len(sells))
+        for i in range(pairs):
+            b, s = buys.iloc[i], sells.iloc[i]
+            realized_total += s["price"] - b["price"] - b["maker_fee"] - s["maker_fee"]
+            realized_fees += b["maker_fee"] + s["maker_fee"]
+            rt_count += 1
+
+    # --- find unpaired fills per ticker ---
+    # Use true economic position (sum of deltas) to handle strategy restarts
+    open_tickers = []
+    unpaired_by_ticker: dict[str, dict] = {}
+    for ticker, g in fills.groupby("market_ticker"):
+        g = g.sort_values("t_receipt")
+        pos = _true_position(g)
+        if pos == 0:
+            continue
+
+        buys = g[g["side"] == "buy"].sort_values("t_receipt")
+        sells = g[g["side"] == "sell"].sort_values("t_receipt")
+        pairs = min(len(buys), len(sells))
+
+        if pos > 0:
+            # Take the LAST abs(pos) unpaired buys (most recent)
+            unpaired = buys.iloc[pairs:]
+            if len(unpaired) > abs(pos):
+                unpaired = unpaired.iloc[-abs(pos):]
+        else:
+            unpaired = sells.iloc[pairs:]
+            if len(unpaired) > abs(pos):
+                unpaired = unpaired.iloc[-abs(pos):]
+
+        open_tickers.append(ticker)
+        unpaired_by_ticker[ticker] = {
+            "pos": int(pos),
+            "avg_entry": unpaired["price"].mean(),
+            "fees": unpaired["maker_fee"].sum(),
+            "unpaired": unpaired,
+        }
+
+    if not open_tickers:
+        print("No open positions.")
+        return
+
+    # --- look up actual settlements ---
+    print(f"Looking up {len(open_tickers)} settlements from Kalshi API...")
+    settlements = _lookup_settlements(open_tickers)
+
+    rows = []
+    for ticker in open_tickers:
+        info = unpaired_by_ticker[ticker]
+        unpaired = info["unpaired"]
+        pos = info["pos"]
+        settlement = settlements.get(ticker)
+
+        if settlement is not None:
+            # Compute actual P&L per contract
+            if pos > 0:
+                # long YES: if settled YES → +100-price, if NO → -price
+                if settlement == "yes":
+                    pnl = ((100 - unpaired["price"]) - unpaired["maker_fee"]).sum()
+                else:
+                    pnl = -(unpaired["price"] + unpaired["maker_fee"]).sum()
+            else:
+                # short YES: if settled NO → +price, if YES → -(100-price)
+                if settlement == "no":
+                    pnl = (unpaired["price"] - unpaired["maker_fee"]).sum()
+                else:
+                    pnl = -(100 - unpaired["price"] + unpaired["maker_fee"]).sum()
+            status = f"{'YES' if settlement == 'yes' else 'NO':>3s}"
+        else:
+            pnl = None
+            status = "  ?"
+
+        rows.append({
+            "ticker": ticker,
+            "pos": pos,
+            "avg_entry": info["avg_entry"],
+            "fees": info["fees"],
+            "settlement": settlement,
+            "status": status,
+            "pnl": pnl,
+        })
+
+    exp = pd.DataFrame(rows).sort_values("pnl", na_position="last")
+
+    settled = exp[exp["pnl"].notna()]
+    unsettled = exp[exp["pnl"].isna()]
+    n_short = (exp["pos"] < 0).sum()
+    n_long = (exp["pos"] > 0).sum()
+
+    print(f"\nOpen positions: {len(exp)} tickers ({n_short} short YES, {n_long} long YES)")
+    print(f"  Settled:    {len(settled)}")
+    print(f"  Unsettled:  {len(unsettled)}")
+    print()
+
+    print(f"{'Ticker':<55s}  {'Pos':>4s}  {'AvgPx':>5s}  {'Result':>6s}  {'P&L':>7s}")
+    print("-" * 85)
+    for _, r in exp.iterrows():
+        pnl_str = f"{r['pnl']:>+7.0f}c" if pd.notna(r["pnl"]) else "      ?"
+        print(f"{r['ticker']:<55s}  {r['pos']:>+4d}  {r['avg_entry']:>5.0f}c  "
+              f"{r['status']:>6s}  {pnl_str}")
+
+    # --- summary ---
+    print()
+    if len(settled) > 0:
+        settled_pnl = settled["pnl"].sum()
+        settled_wins = (settled["pnl"] > 0).sum()
+        settled_losses = (settled["pnl"] <= 0).sum()
+        print(f"Settled open P&L:      {settled_pnl:+.0f}c (${settled_pnl/100:+.2f})  "
+              f"[{settled_wins}W / {settled_losses}L]")
+
+    if len(unsettled) > 0:
+        print(f"Unsettled:             {len(unsettled)} positions still open")
+
+    print()
+    print("--- TOTAL P&L ---")
+    print(f"Realized (round-trips):  {realized_total:+.0f}c (${realized_total/100:+.2f})  "
+          f"[{rt_count} trades]")
+    if len(settled) > 0:
+        total = realized_total + settled_pnl
+        print(f"+ Settled open pos:      {settled_pnl:+.0f}c (${settled_pnl/100:+.2f})")
+        print(f"= Net P&L:               {total:+.0f}c (${total/100:+.2f})")
 
 
 def cmd_status() -> None:
@@ -224,6 +402,9 @@ def cmd_summary() -> None:
     print()
     print("=== POSITIONS ===")
     cmd_positions()
+    print()
+    print("=== EXPOSURE ===")
+    cmd_exposure()
 
 
 COMMANDS = {
@@ -231,6 +412,7 @@ COMMANDS = {
     "fills": cmd_fills,
     "quotes": cmd_quotes,
     "positions": cmd_positions,
+    "exposure": cmd_exposure,
     "status": cmd_status,
 }
 

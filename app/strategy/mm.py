@@ -7,8 +7,11 @@ never wall clock. This guarantees replay fidelity.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from app.events import (
     BookInvalidated,
@@ -37,6 +40,20 @@ class MMConfig:
     agg_skew_max: int = 15        # stop quoting overexposed side at this |net|
     agg_skew_step_size: int = 5   # net positions per widening tier
     agg_skew_step_cents: int = 1  # cents to widen per tier
+    state_path: Path | None = None  # persist positions to JSON file across restarts
+    # Scaled per-ticker skew: widen by cents_per_contract * |position|
+    skew_cents_per_contract: int = 1  # 0 = legacy fixed-1c skew
+    # Position age skew: widen quotes as inventory ages
+    age_skew_interval_s: float = 1800.0  # add step_cents per this many seconds held
+    age_skew_step_cents: int = 1         # cents to widen per age tier
+    max_age_skew_cents: int = 10         # cap on age-based widening
+    # Absolute exposure soft limit: suppress new-exposure side above this
+    abs_exposure_soft_limit: int = 150   # 0 = disabled
+    # Player-level correlated skew: track net position across thresholds for same player
+    use_player_skew: bool = True
+    player_skew_cents_per_contract: int = 2
+    # Minimum volume filter: don't quote until ticker has seen N trades
+    min_trades_to_quote: int = 20  # 0 = disabled
 
 
 def maker_fee_cents(price_cents: int) -> int:
@@ -157,12 +174,52 @@ class MMStrategy:
         self._positions: dict[str, int] = {}
         self._aggregate_abs_position: int = 0
         self._agg_net_position: int = 0
+        # Position age tracking: ticker → t_receipt when position first went non-zero
+        self._position_opened_at: dict[str, float] = {}
+        # Player-level net positions: player_key → net contracts across all thresholds
+        self._player_positions: dict[str, int] = {}
+        # Trade count per ticker for minimum volume filter
+        self._trade_counts: dict[str, int] = {}
+        # Load persisted positions if state file exists
+        if self._config.state_path is not None and self._config.state_path.exists():
+            self._load_state()
         # ticker → {"bid": OrderSideState, "ask": OrderSideState}
         self._order_state: dict[str, dict[str, OrderSideState]] = {}
         # Last emitted quote per ticker (for change-detection)
         self._last_quote: dict[str, tuple[int | None, int | None]] = {}
         # Collected strategy events for the caller to emit to silver
         self.pending_events: list[Event] = []
+
+    # -- state persistence --
+
+    def _load_state(self) -> None:
+        path = self._config.state_path
+        assert path is not None
+        with open(path) as f:
+            data = json.load(f)
+        self._positions = {k: v for k, v in data.get("positions", {}).items() if v != 0}
+        self._aggregate_abs_position = sum(abs(v) for v in self._positions.values())
+        self._agg_net_position = sum(self._positions.values())
+        self._position_opened_at = {
+            k: v for k, v in data.get("position_opened_at", {}).items()
+            if k in self._positions
+        }
+        # Rebuild player positions from per-ticker positions
+        for ticker, pos in self._positions.items():
+            pk = self._player_key(ticker)
+            if pk:
+                self._player_positions[pk] = self._player_positions.get(pk, 0) + pos
+        log.info("loaded %d positions from %s", len(self._positions), path)
+
+    def _save_state(self) -> None:
+        path = self._config.state_path
+        assert path is not None
+        cleaned = {k: v for k, v in self._positions.items() if v != 0}
+        opened_at = {k: v for k, v in self._position_opened_at.items() if k in cleaned}
+        tmp = path.with_suffix(".tmp")
+        with open(tmp, "w") as f:
+            json.dump({"positions": cleaned, "position_opened_at": opened_at}, f)
+        os.replace(tmp, path)
 
     # -- public API --
 
@@ -205,12 +262,26 @@ class MMStrategy:
         self._aggregate_abs_position = sum(abs(v) for v in self._positions.values())
         self._agg_net_position = sum(self._positions.values())
 
+        # Position age tracking
+        if pos_before == 0 and pos_after != 0:
+            self._position_opened_at[ticker] = t
+        elif pos_after == 0:
+            self._position_opened_at.pop(ticker, None)
+
+        # Player-level position tracking
+        pk = self._player_key(ticker)
+        if pk:
+            self._player_positions[pk] = self._player_positions.get(pk, 0) + delta
+
         state = self._get_side(ticker, side)
         state.remaining_size = remaining_size
         if remaining_size == 0:
             state.state = "idle"
             state.order_id = None
             state.price = None
+
+        if self._config.state_path is not None:
+            self._save_state()
 
         self.pending_events.append(MMFillEvent(
             t_receipt=t,
@@ -227,6 +298,15 @@ class MMStrategy:
         ))
 
     # -- internal --
+
+    @staticmethod
+    def _player_key(ticker: str) -> str | None:
+        """Extract player key from ticker for correlated position tracking.
+
+        KXNBAPTS-26APR25DENMIN-DENCBRAUN0-10 → 'DENCBRAUN0'
+        """
+        parts = ticker.split("-")
+        return parts[2] if len(parts) >= 4 else None
 
     def _get_side(self, ticker: str, side: str) -> OrderSideState:
         if ticker not in self._order_state:
@@ -293,16 +373,67 @@ class MMStrategy:
             if reason_no_ask is None:
                 reason_no_ask = "agg_limit"
 
-        should_bid = reason_no_bid is None
-        should_ask = reason_no_ask is None
+        # Minimum volume filter
+        if self._config.min_trades_to_quote > 0:
+            if self._trade_counts.get(ticker, 0) < self._config.min_trades_to_quote:
+                if reason_no_bid is None:
+                    reason_no_bid = "low_volume"
+                if reason_no_ask is None:
+                    reason_no_ask = "low_volume"
+
+        # Absolute exposure soft limit
+        if (self._config.abs_exposure_soft_limit > 0
+                and self._aggregate_abs_position >= self._config.abs_exposure_soft_limit):
+            if position >= 0 and reason_no_bid is None:
+                reason_no_bid = "abs_soft_limit"
+            if position <= 0 and reason_no_ask is None:
+                reason_no_ask = "abs_soft_limit"
 
         # Skew quotes when carrying inventory
         bid_price = update.bid_yes
         ask_price = update.ask_yes
-        if position > self._config.skew_threshold:
-            bid_price = max(1, bid_price - 1)
-        elif position < -self._config.skew_threshold:
-            ask_price = min(99, ask_price + 1)
+
+        # Per-ticker skew (scaled or legacy)
+        if self._config.skew_cents_per_contract > 0:
+            if abs(position) >= self._config.skew_threshold:
+                skew = abs(position) * self._config.skew_cents_per_contract
+                if position > 0:
+                    bid_price = max(1, bid_price - skew)
+                else:
+                    ask_price = min(99, ask_price + skew)
+        else:
+            if position > self._config.skew_threshold:
+                bid_price = max(1, bid_price - 1)
+            elif position < -self._config.skew_threshold:
+                ask_price = min(99, ask_price + 1)
+
+        # Position age skew
+        if self._config.age_skew_interval_s > 0 and position != 0:
+            opened_at = self._position_opened_at.get(ticker)
+            if opened_at is not None:
+                age_s = update.t_receipt - opened_at
+                age_tiers = int(age_s / self._config.age_skew_interval_s)
+                age_skew = min(
+                    age_tiers * self._config.age_skew_step_cents,
+                    self._config.max_age_skew_cents,
+                )
+                if age_skew > 0:
+                    if position > 0:
+                        bid_price = max(1, bid_price - age_skew)
+                    else:
+                        ask_price = min(99, ask_price + age_skew)
+
+        # Player-level correlated skew
+        if self._config.use_player_skew:
+            pk = self._player_key(ticker)
+            if pk:
+                player_pos = self._player_positions.get(pk, 0)
+                if player_pos != 0:
+                    p_skew = abs(player_pos) * self._config.player_skew_cents_per_contract
+                    if player_pos > 0:
+                        bid_price = max(1, bid_price - p_skew)
+                    else:
+                        ask_price = min(99, ask_price + p_skew)
 
         # Aggregate directional skew
         bid_adj, ask_adj, suppress_bid, suppress_ask = self._agg_skew_adjustment()
@@ -344,6 +475,9 @@ class MMStrategy:
     def _on_trade(self, trade: TradeEvent) -> None:
         if not trade.market_ticker.startswith(self._config.series_filter):
             return
+        self._trade_counts[trade.market_ticker] = (
+            self._trade_counts.get(trade.market_ticker, 0) + 1
+        )
         self._client.check_fill(trade)
 
     def _on_book_invalidated(self, event: BookInvalidated) -> None:

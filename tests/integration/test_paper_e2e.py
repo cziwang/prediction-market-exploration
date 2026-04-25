@@ -86,7 +86,12 @@ def _build_fixture_frames():
 def test_e2e_paper_trading():
     """Full pipeline: fixture frames → transform → strategy → verify."""
     transform = KalshiTransform()
-    config = MMConfig(min_spread_cents=3, max_position=5, order_size=1)
+    config = MMConfig(
+        min_spread_cents=3, max_position=5, order_size=1,
+        skew_cents_per_contract=0, age_skew_interval_s=0.0,
+        abs_exposure_soft_limit=0, use_player_skew=False,
+        min_trades_to_quote=0,
+    )
     strategy = MMStrategy(order_client=None, config=config)  # type: ignore[arg-type]
     client = PaperOrderClient(strategy)
     strategy._client = client
@@ -139,7 +144,12 @@ def test_e2e_paper_trading():
 def test_e2e_connection_change():
     """Verify conn_id change invalidates books and cancels orders."""
     transform = KalshiTransform()
-    config = MMConfig(min_spread_cents=3, max_position=5, order_size=1)
+    config = MMConfig(
+        min_spread_cents=3, max_position=5, order_size=1,
+        skew_cents_per_contract=0, age_skew_interval_s=0.0,
+        abs_exposure_soft_limit=0, use_player_skew=False,
+        min_trades_to_quote=0,
+    )
     strategy = MMStrategy(order_client=None, config=config)  # type: ignore[arg-type]
     client = PaperOrderClient(strategy)
     strategy._client = client
