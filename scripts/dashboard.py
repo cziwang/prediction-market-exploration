@@ -256,14 +256,49 @@ def main():
     # --- Trade panel (bottom) ---
     st.divider()
     with st.expander("Place Order", expanded=False):
-        trade_cols = st.columns([3, 1, 1, 1, 1])
         with state.lock:
             all_tickers = sorted(state.subscribed_tickers)
-        ticker = trade_cols[0].selectbox("Ticker", all_tickers if all_tickers else ["(loading...)"])
-        action = trade_cols[1].selectbox("Action", ["buy", "sell"])
-        price = trade_cols[2].number_input("Price (cents)", min_value=1, max_value=99, value=50)
-        size = trade_cols[3].number_input("Size", min_value=1, max_value=10, value=1)
-        if trade_cols[4].button("Submit Order"):
+
+        row1 = st.columns([4, 1])
+        ticker = row1[0].selectbox("Ticker", all_tickers if all_tickers else ["(loading...)"])
+
+        # Show live book for selected ticker
+        with state.lock:
+            book = state.books.get(ticker)
+        if book:
+            bid = book.best_bid
+            ask = book.best_ask
+            mid = book.mid
+            spread = (ask - bid) if bid is not None and ask is not None else None
+            row1[1].markdown(
+                f"**Bid** {bid}c &nbsp; **Ask** {ask}c &nbsp; "
+                f"**Mid** {mid}c &nbsp; **Spread** {spread}c"
+                if bid is not None else "Book not loaded"
+            )
+        else:
+            row1[1].markdown("*Book not loaded*")
+            bid, ask = None, None
+
+        row2 = st.columns([1, 1, 1, 1, 1])
+        action = row2[0].selectbox("Action", ["buy", "sell"])
+        order_type = row2[1].selectbox("Type", ["limit", "market"])
+
+        if order_type == "market":
+            # Market order: cross the spread
+            if action == "buy" and ask is not None:
+                price = ask
+                row2[2].metric("Price", f"{price}c (ask)")
+            elif action == "sell" and bid is not None:
+                price = bid
+                row2[2].metric("Price", f"{price}c (bid)")
+            else:
+                price = 50
+                row2[2].warning("No book")
+        else:
+            price = row2[2].number_input("Price (cents)", min_value=1, max_value=99, value=50)
+
+        size = row2[3].number_input("Size", min_value=1, max_value=10, value=1)
+        if row2[4].button("Submit Order"):
             try:
                 result = place_order(ticker, "yes", action, price, size)
                 st.success(f"Order placed: {result}")
