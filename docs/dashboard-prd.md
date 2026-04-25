@@ -47,21 +47,50 @@ All data comes through a single authenticated Kalshi WS connection. No S3 pollin
 
 | Channel | What it gives you | Latency |
 |---------|-------------------|---------|
-| `fill` | Your fills with price, size, fee, post-position | <100ms push |
-| `user_orders` | Order ACKs, cancellations, rejections, remaining size | <100ms push |
-| `market_positions` | Net position, entry price, cost basis, realized/unrealized P&L per ticker | <100ms push |
+| `fill` | Your fills with price, size, fee, is_taker, post-position | <100ms push |
+| `user_orders` | Order status (resting/canceled/executed), remaining size, fees | <100ms push |
+| `market_positions` | Net position, cost basis, realized P&L, fees paid (no unrealized) | <100ms push |
 | `market_lifecycle_v2` | Market open/close/settled status | Event-driven |
 
 ### What each private channel provides
 
 **`fill`** — authoritative fill data:
-- `order_id`, `market_ticker`, `action` (buy/sell), `count_fp` (size), `yes_price_dollars`, `fee_cost`, `is_taker`, `post_position_fp`, `ts_ms`
+- `trade_id` — unique fill identifier
+- `order_id` — which order was filled
+- `market_ticker` — ticker
+- `action` — `"buy"` or `"sell"`
+- `side` — `"yes"` or `"no"`
+- `yes_price_dollars` — fill price (dollar string, e.g. `"0.5200"`)
+- `count_fp` — contracts filled (fixed-point, e.g. `"1.00"`)
+- `fee_cost` — exchange fee for this fill (dollar string)
+- `is_taker` — `true` if we crossed the spread
+- `post_position_fp` — our position after this fill
+- `client_order_id` — our correlation ID (if set on placement)
+- `purchased_side` — which side was purchased
+- `ts_ms` — millisecond timestamp
 
-**`user_orders`** — order state machine:
-- `order_id`, `client_order_id`, `market_ticker`, `status` (pending/resting/canceled/executed/rejected), `side`, `action`, `yes_price_dollars`, `remaining_count_fp`, `ts_ms`
+**`user_orders`** — order lifecycle:
+- `order_id`, `client_order_id` — identifiers
+- `ticker` — market ticker
+- `status` — `"resting"`, `"canceled"`, or `"executed"` (3 states only)
+- `side` — `"yes"` or `"no"`
+- `yes_price_dollars` — order price
+- `initial_count_fp` — original order size
+- `fill_count_fp` — how many filled so far
+- `remaining_count_fp` — how many still resting
+- `maker_fees_dollars`, `taker_fees_dollars` — cumulative fees on this order
+- `maker_fill_cost_dollars`, `taker_fill_cost_dollars` — cumulative fill cost
+- `created_ts_ms`, `last_updated_ts_ms` — timestamps
 
 **`market_positions`** — Kalshi's authoritative position view:
-- `market_ticker`, `position_fp`, `entry_price_cents`, `cost_basis`, `realized_pnl`, `unrealized_pnl`
+- `market_ticker` — ticker
+- `position_fp` — net contracts (positive = long YES)
+- `position_cost_dollars` — current cost basis (dollar string)
+- `realized_pnl_dollars` — realized P&L (dollar string, **does NOT include fees**)
+- `fees_paid_dollars` — total fees paid (dollar string, reported separately)
+- `position_fee_cost_dollars` — position-level fee cost
+- `volume_fp` — total volume traded
+- **Note:** No `unrealized_pnl` field. MTM must be computed from live book mid.
 
 **`market_lifecycle_v2`** — market status changes:
 - `market_ticker`, `event_type` (opened/activated/deactivated/determined/settled), `ts_ms`
@@ -73,7 +102,7 @@ All data comes through a single authenticated Kalshi WS connection. No S3 pollin
 | Order book (all levels) | WS `orderbook_snapshot` + `orderbook_delta` | <100ms |
 | Market trades | WS `trade` | <100ms |
 | Our fills | WS `fill` | <100ms |
-| Our positions + entry price + P&L | WS `market_positions` | <100ms |
+| Our positions + cost basis + realized P&L + fees | WS `market_positions` | <100ms |
 | Our resting orders | WS `user_orders` | <100ms |
 | Market open/closed status | WS `market_lifecycle_v2` | Event-driven |
 | Manual order placement | Kalshi REST | ~200ms |
@@ -84,10 +113,14 @@ All data comes through a single authenticated Kalshi WS connection. No S3 pollin
 ### 1. Overview (top bar, always visible)
 
 ```
-LIVE  |  Positions: 21 tickers, 40 abs, -10 net  |  P&L: +$6.76 realized, +$1.29 MTM  |  [KILL ALL]
+LIVE  |  Positions: 21 tickers, 40 abs, -10 net  |  Realized: +$6.76  Fees: -$0.82  MTM: +$1.29  Net: +$7.23  |  [KILL ALL]
 ```
 
 - Green "LIVE" indicator pulses on each WS message
+- Realized = `sum(realized_pnl_dollars)` from `market_positions` (excludes fees)
+- Fees = `sum(fees_paid_dollars)` from `market_positions`
+- MTM = unrealized P&L computed from live book mid vs entry price
+- Net = Realized - Fees + MTM
 - Red "KILL ALL" button cancels all resting orders via REST
 
 ### 2. Positions table (main view)
@@ -159,9 +192,9 @@ PHXDBROOKS3-25             BID    53c    1     1          Resting  [X]
 OKCSGA2-40                 ASK    93c    1     1          Resting  [X]
 ```
 
-- Updated in real-time via `user_orders` push (ACK, cancel, reject, fill)
+- Updated in real-time via `user_orders` push (resting, canceled, executed)
 - Cancel button per order
-- Shows rejected orders with error message
+- Grayed out when canceled or fully executed
 
 ### 7. Market status (from WS `market_lifecycle_v2`)
 
@@ -250,12 +283,22 @@ Private channels deliver data for your account across all markets — no need to
 
 All real-time, no S3 dependency:
 
-- **Positions:** From WS `market_positions` channel — gives net position, entry price, cost basis, realized P&L, unrealized P&L per ticker. This is Kalshi's authoritative view.
-- **Fills:** From WS `fill` channel — each fill includes price, size, fee, and post-position. Accumulated in-memory for session history.
-- **Round-trip P&L:** FIFO pairing of accumulated fills (reuse `mm_stats.py` logic on in-memory fill list).
-- **MTM P&L:** Two sources that should agree:
-  - WS `market_positions` provides `unrealized_pnl` directly
-  - Can also compute from `(mid - entry) * pos` using live book mid from `orderbook_delta`
+- **Positions:** From WS `market_positions` — gives `position_fp` (net contracts) and `position_cost_dollars` (cost basis) per ticker. This is Kalshi's authoritative view.
+- **Realized P&L:** From WS `market_positions` — `realized_pnl_dollars` per ticker. **Does not include fees.** Subtract `fees_paid_dollars` for net realized P&L.
+- **Unrealized P&L:** Computed by dashboard. `market_positions` does NOT provide unrealized P&L. Compute as: `(mid - cost_per_contract) * position` where mid comes from live book via `orderbook_delta`.
+- **Fees:** Sum of `fees_paid_dollars` across all tickers from `market_positions`, or sum of `fee_cost` across all fills from `fill` channel. Both should agree.
+- **Fills:** From WS `fill` channel — each fill includes `fee_cost` and `post_position_fp`. Accumulated in-memory for session fill history and round-trip pairing.
+
+### Overview bar P&L formula
+
+```
+Realized    = sum(realized_pnl_dollars) across all tickers from market_positions
+Fees        = sum(fees_paid_dollars) across all tickers from market_positions
+Unrealized  = sum((book_mid - entry_price) * position) for each open position
+                where book_mid from orderbook_delta, entry from position_cost / position
+Net P&L     = Realized - Fees + Unrealized
+```
+
 - **On startup:** Optionally load today's fills from S3 silver to backfill session history before WS was connected. After that, purely WS-driven.
 
 ## File Structure
@@ -281,22 +324,23 @@ streamlit>=1.30
 ## MVP Scope
 
 **v1 (build first):**
-1. WS connection + live book state for KXNBAPTS tickers
-2. Positions table with live bid/ask/mid from WS
-3. Trade feed (live trades)
-4. Kill-all button
+1. WS connection (public + private channels) for KXNBAPTS tickers
+2. Positions table with live bid/ask/mid from `orderbook_delta` + positions from `market_positions`
+3. P&L bar (realized from `market_positions`, unrealized from book mid, fees)
+4. Fill feed from `fill` channel + trade feed from `trade` channel
+5. Resting orders from `user_orders` channel
+6. Kill-all button
 
 **v2 (add after v1 works):**
-5. Manual order placement (trade panel)
-6. Flatten position button
-7. Order book depth view
-8. Resting orders display + cancel
+7. Manual order placement (trade panel)
+8. Flatten position button
+9. Order book depth view
+10. Cancel individual orders
 
 **v3 (later):**
-9. P&L charts over time
-10. Player-level P&L aggregation
-11. Adverse selection metrics
-12. Private WS channels (fill, user_orders) for real-time strategy fill display
+11. P&L charts over time
+12. Player-level P&L aggregation
+13. Adverse selection metrics
 
 ## Run
 
