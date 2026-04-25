@@ -5,6 +5,14 @@ Run: streamlit run scripts/dashboard.py
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# Ensure repo root is on sys.path so `app.*` and `scripts.*` imports work
+_repo = str(Path(__file__).resolve().parent.parent)
+if _repo not in sys.path:
+    sys.path.insert(0, _repo)
+
 import time
 from datetime import datetime, timezone
 
