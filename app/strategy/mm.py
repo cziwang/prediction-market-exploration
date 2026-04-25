@@ -198,6 +198,8 @@ class MMStrategy:
         self._player_positions: dict[str, int] = {}
         # Trade count per ticker for minimum volume filter
         self._trade_counts: dict[str, int] = {}
+        # Last-seen book mid per ticker for adverse selection measurement
+        self._last_mid: dict[str, int] = {}
         # Load persisted positions if state file exists
         if self._config.state_path is not None and self._config.state_path.exists():
             self._load_state()
@@ -312,7 +314,7 @@ class MMStrategy:
             position_after=pos_after,
             maker_fee=maker_fee_cents(price),
             order_id=order_id,
-            book_mid_at_fill=0,  # not available in paper mode
+            book_mid_at_fill=self._last_mid.get(ticker, 0),
         ))
 
     # -- internal --
@@ -371,6 +373,7 @@ class MMStrategy:
 
         # Net-of-fee edge check
         mid = (update.bid_yes + update.ask_yes) // 2
+        self._last_mid[ticker] = mid
         fee = maker_fee_cents(mid)
         net_half_spread = (spread // 2) - fee
 
