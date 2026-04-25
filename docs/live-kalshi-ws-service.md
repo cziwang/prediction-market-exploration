@@ -2,8 +2,7 @@
 
 Deployment guide for the Kalshi WebSocket ingester
 (`scripts/live/kalshi_ws/__main__.py`). Design lives in
-[`data-flow.md`](data-flow.md); the NBA-side counterpart is
-[`live-nba-cdn-service.md`](live-nba-cdn-service.md).
+[`data-flow.md`](data-flow.md).
 
 The service writes raw frames to
 `s3://prediction-markets-data/bronze/kalshi_ws/` via `BronzeWriter` —

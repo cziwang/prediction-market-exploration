@@ -2,7 +2,7 @@
 
 ## Goal
 
-Capture raw NBA play-by-play and raw Kalshi live market data, archive them byte-for-byte in S3 for backtesting and auditability, and — in the same process — feed a transformer that drives both the live trading strategy *and* a Parquet-based silver layer for notebook exploration.
+Capture raw Kalshi live market data, archive it byte-for-byte in S3 for backtesting and auditability, and — in the same process — feed a transformer that drives both the live trading strategy *and* a Parquet-based silver layer for notebook exploration.
 
 The guiding principle: **one transform execution site.** Raw bytes are the wire format. The strategy never touches raw JSON. Backtest and live trading use the same bytes, the same transform code, and — because the transform is applied exactly once per event — produce bit-for-bit consistent outputs. Parity is structural, not disciplinary.
 
@@ -54,7 +54,7 @@ df["home_score"] = df["action"].apply(lambda a: a.get("scoreHome"))   # in a pan
 
 - **Ingester**: talks to the external API/WebSocket, timestamps every record, and hands the raw bytes to the bronze writer and to `transform()`. Never interprets fields.
 - **BronzeWriter**: async task, owns an in-memory buffer per `(source, channel)`. Flushes on size (5 MB) or time (60 s) by gzipping the batch and writing to S3 with a time-partitioned key. Flushes on clean shutdown.
-- **`transform()`**: pure (NBA) or small-state (Kalshi orderbook) function mapping raw → typed event. Called synchronously on the ingester's task. Returns `None` for frames that don't produce an event.
+- **`transform()`**: small-state function (Kalshi orderbook) mapping raw → typed event. Called synchronously on the ingester's task. Returns `None` for frames that don't produce an event.
 - **Strategy**: `on_event(event)` is called synchronously in the same task. Must be non-blocking. All stateful strategy logic lives here.
 - **SilverWriter**: async task, buffers typed events per event-type, flushes to Parquet on S3 periodically (e.g., every 5 min) and on shutdown.
 
@@ -65,7 +65,7 @@ An earlier draft routed everything through a Kinesis Data Stream and wrote bronz
 | Dropped capability | Mitigation |
 |---|---|
 | 7-day stream replay | Bronze on S3 is the replay source. Slightly slower (download + gunzip) but same bytes. |
-| Durability before any consumer reads | Crash blast radius is the in-memory bronze buffer (≤ 5 MB / 60 s). Kalshi re-sends a fresh orderbook snapshot on reconnect; NBA poller resumes from the last committed state. |
+| Durability before any consumer reads | Crash blast radius is the in-memory bronze buffer (≤ 5 MB / 60 s). Kalshi re-sends a fresh orderbook snapshot on reconnect. |
 | Independent multi-consumer fan-out | Only one consumer is planned (strategy + silver, both in-process). Adding one later means adding an async task, not new infra. |
 | Managed back-pressure | Buffer size is capped; if S3 uploads stall for minutes, the process logs and exits (fail-fast beats silent memory growth). |
 
@@ -75,8 +75,7 @@ If any of these mitigations stops holding — e.g., a second independent consume
 
 ```
 app/
-├── clients/                    # raw I/O, per-source
-│   ├── nba_cdn.py                # NBA CDN REST
+├── clients/                    # raw I/O
 │   ├── kalshi_sdk.py             # Kalshi REST via official SDK
 │   ├── kalshi_rest.py            # Kalshi historical REST via raw HTTP
 │   └── kalshi_rest_orders.py     # (Phase 2, planned) REST order placement
@@ -84,7 +83,7 @@ app/
 │   ├── s3_raw.py                 # one-shot JSON puts for batch fetchers
 │   ├── bronze_writer.py          # async batched gzip-JSONL writer
 │   └── silver_writer.py          # async batched Parquet writer
-├── transforms/                 # pure raw → typed
+├── transforms/                 # raw → typed
 │   ├── __init__.py
 │   └── kalshi_ws.py              # WS frame → OrderBookUpdate | TradeEvent | …
 ├── events.py                   # frozen dataclasses for every domain event
@@ -92,13 +91,12 @@ app/
     └── mm.py                     # passive market maker on KXNBAPTS
 
 scripts/
-├── live/                         # live ingester+transformer+writer processes
-│   ├── kalshi_ws/                  # Kalshi WS → bronze + transform + strategy + silver
-│   └── nba_cdn/                    # NBA polling → bronze (transform + silver planned)
+├── live/                         # live ingester+transformer+writer process
+│   └── kalshi_ws/                  # Kalshi WS → bronze + transform + strategy + silver
 └── materialize/                  # (planned) rebuild silver from bronze after transform changes
 ```
 
-One live process per source, so a Kalshi WS reconnect storm doesn't force an NBA poller restart and vice versa. They share `BronzeWriter`, `SilverWriter`, and strategy state wiring from `app/`.
+`BronzeWriter`, `SilverWriter`, and strategy state wiring live in `app/`.
 
 ## Ingestion layer
 
@@ -134,10 +132,6 @@ Key properties:
 - **`silver.emit` is fire-and-forget** (in-memory buffer; flusher task owns S3 writes).
 - **`async with` ensures flush on shutdown.** SIGINT → both writers drain their buffers to S3 before the process exits.
 
-### NBA CDN polling
-
-Same shape, different ingester. `scripts/live/nba_cdn/` discovers active games via `todaysScoreboard_00.json`, polls each live game's PBP and boxscore on a 3 s cadence, and emits every new action plus every non-304 scoreboard/odds/boxscore response to bronze under `source="nba_cdn"`. Transform is stateless (`parse_action`); same bronze and silver writers as Kalshi.
-
 ## Bronze storage
 
 Authoritative raw history, written by `BronzeWriter` directly from the live process. Gzipped JSONL, one file per flush, time-partitioned keys.
@@ -148,8 +142,6 @@ s3://prediction-markets-data/bronze/
     orderbook_delta/2026/04/18/22/<uuid>.jsonl.gz
     trade/2026/04/18/22/<uuid>.jsonl.gz
     lifecycle/2026/04/18/22/<uuid>.jsonl.gz
-  nba_cdn/
-    live_pbp/2026/04/18/22/<uuid>.jsonl.gz
 ```
 
 Each JSONL line is a wrapped record:
@@ -210,9 +202,6 @@ This is `pyarrow` writing directly from the transformer — option 2 from the ea
 
 ```
 silver/
-  nba_cdn/
-    ScoreEvent/date=2026-04-18/v=1/part-*.parquet
-    PeriodChange/date=2026-04-18/v=1/part-*.parquet
   kalshi_ws/
     OrderBookUpdate/date=2026-04-18/v=1/part-*.parquet
     TradeEvent/date=2026-04-18/v=1/part-*.parquet
@@ -222,7 +211,7 @@ silver/
 
 ### Strategy bootstrap at startup
 
-The strategy is stateful over the event stream (rolling stats, score state, orderbook state). On process start, it needs history, not just live events.
+The strategy is stateful over the event stream (orderbook state, positions). On process start, it needs history, not just live events.
 
 ```
 startup:
@@ -241,24 +230,6 @@ Every downstream component (live strategy, backtest replay, monitoring) sees the
 from dataclasses import dataclass
 
 @dataclass(frozen=True)
-class ScoreEvent:
-    t_receipt: float        # our wall clock when we first observed the action
-    game_id: str
-    action_number: int      # NBA's monotonic sequence; idempotency key
-    period: int
-    clock: str              # raw NBA clock string, e.g. "PT04M22.00S"
-    home: int
-    away: int
-    scoring_team: str | None   # "home" | "away" | None for non-scoring actions
-    points: int                # 0, 1, 2, or 3
-
-@dataclass(frozen=True)
-class PeriodChange:
-    t_receipt: float
-    game_id: str
-    new_period: int
-
-@dataclass(frozen=True)
 class OrderBookUpdate:
     t_receipt: float
     market_ticker: str
@@ -275,7 +246,13 @@ class TradeEvent:
     price: int              # cents
     size: int
 
-Event = ScoreEvent | PeriodChange | OrderBookUpdate | TradeEvent
+@dataclass(frozen=True)
+class BookInvalidated:
+    t_receipt: float
+    market_ticker: str
+
+# Plus strategy events: MMQuoteEvent, MMOrderEvent, MMFillEvent
+Event = OrderBookUpdate | TradeEvent | BookInvalidated | ...
 ```
 
 Design choices worth naming:
@@ -298,10 +275,10 @@ It reads bronze from S3, runs the current transform, and writes to `silver/.../v
 
 ## What stays raw (bronze)
 
-Bronze S3 files always hold the **raw** bytes from NBA and Kalshi — never derived events. Two reasons:
+Bronze S3 files always hold the **raw** bytes from Kalshi — never derived events. Two reasons:
 
-1. **Schema evolution without backfills.** If six months from now the strategy needs `action["assistPersonId"]` or a Kalshi field we didn't extract, we re-run the transform over bronze. If we'd stored only derived `ScoreEvent`, we'd have to refetch or accept a blind spot.
-2. **Transform bug recovery.** When (not if) we find a bug in `parse_action`, we fix the function, rebuild silver, and move on. No data loss.
+1. **Schema evolution without backfills.** If six months from now the strategy needs a Kalshi field we didn't extract, we re-run the transform over bronze. If we'd stored only derived events, we'd have to refetch or accept a blind spot.
+2. **Transform bug recovery.** When (not if) we find a bug in the transform, we fix the function, rebuild silver, and move on. No data loss.
 
 Bronze is the permanent home. Silver is a cache of the transformer's output; it can always be rebuilt from bronze.
 
@@ -332,16 +309,15 @@ Pure library functions are easy to test. One golden-file pattern works well:
 
 ```
 tests/
-└── transforms/
-    ├── fixtures/
-    │   ├── nba_action_made_three.json
-    │   ├── nba_action_turnover.json
-    │   ├── kalshi_ws_orderbook_snapshot.json
-    │   └── kalshi_ws_orderbook_delta.json
-    └── test_nba_pbp.py
+├── transforms/
+│   └── test_kalshi_ws.py          # snapshot/delta parsing, conn_id invalidation
+├── strategy/
+│   └── test_mm.py                 # quoting, state machine, position limits, fills
+└── integration/
+    └── test_paper_e2e.py          # full pipeline with fixture frames
 ```
 
-Each fixture is one raw record captured from a real response. The test calls `parse_action(fixture, t_receipt=0)` (or `OrderBookState.apply(...)`) and asserts the resulting typed event. Low effort, catches schema drift early.
+Each test builds inline fixtures (raw WS frames) and asserts the resulting typed events or strategy behavior. Low effort, catches schema drift early.
 
 Additionally, a simple property test that `app.transforms` is pure:
 
@@ -357,11 +333,7 @@ Catches the non-determinism class of bugs that would break backtest parity.
 
 1. **Silver flush cadence.** 5 min feels right for notebook freshness; too short creates lots of tiny Parquet files (bad for Athena later). Compaction can come later.
 2. **Bronze file sizing.** 5 MB / 60 s gives ~hundreds of KB gzipped — fine for ad-hoc re-reads, smallish for bulk scans. Revisit if bronze replay becomes a hotspot.
-3. ~~**Process supervision.**~~ **Resolved.** Both ingesters run under systemd on EC2. See [`docs/live-kalshi-ws-service.md`](live-kalshi-ws-service.md) and [`docs/live-nba-cdn-service.md`](live-nba-cdn-service.md).
-4. ~~**NBA migration.**~~ **Resolved.** NBA poller migrated to `scripts/live/nba_cdn/` + `BronzeWriter`. Deployed as `nba-live.service`.
-5. **Subscription scope for Kalshi.** Currently covers `orderbook_delta` + `trade` across `KXNBAGAME`, `KXNBASPREAD`, `KXNBATOTAL`, and `KXNBAPTS`. Remaining player-prop series (`KXNBAREB`, `KXNBAAST`, `KXNBA3PT`, `KXNBABLK`, `KXNBASTL`) and the rarer channels (`ticker`, `market_lifecycle_v2`) are deliberately excluded until we see whether one WS connection handles the current ~500 markets comfortably. Phase 2 adds private channels (`fill`, `user_orders`, `market_lifecycle_v2`, `market_positions`) — see [`docs/strategy-kalshi-mm.md`](strategy-kalshi-mm.md).
-6. **Retroactive NBA corrections.** The poller detects them via periodic snapshot hashes but doesn't apply them. Does the transform re-emit corrected `ScoreEvent` with the same `action_number` but a new `t_receipt`? Consumers would treat `(game_id, action_number)` as an upsert key. Defer until observed.
-7. **Kalshi WS gap handling.** On a `seq` gap, resubscribe and consume the fresh snapshot. Transform resets `OrderBookState`, seeds from the snapshot. Standard pattern but worth implementing and testing with synthetic gaps.
-8. ~~**Strategy checkpointing.**~~ **Resolved.** Phase 2 design uses `bootstrap()` to seed positions from Kalshi REST on startup, cancel orphan orders, then resume from live WS events. See [`docs/strategy-kalshi-mm.md`](strategy-kalshi-mm.md).
-9. **Schema versioning.** Additive-only changes to event dataclasses for now. Breaking changes go in a new `v=N/` silver partition. Revisit if a schema change can't be additive.
-10. **When to reintroduce Kinesis.** Triggers: a second independent consumer becomes real, the strategy must survive ingester restarts without dropping live events, or bronze replay latency (download + gunzip) becomes painful for development.
+3. **Subscription scope for Kalshi.** Currently covers `orderbook_delta` + `trade` across `KXNBAGAME`, `KXNBASPREAD`, `KXNBATOTAL`, and `KXNBAPTS`. Remaining player-prop series (`KXNBAREB`, `KXNBAAST`, `KXNBA3PT`, `KXNBABLK`, `KXNBASTL`) and the rarer channels (`ticker`, `market_lifecycle_v2`) are deliberately excluded until we see whether one WS connection handles the current ~500 markets comfortably. Phase 2 adds private channels (`fill`, `user_orders`, `market_lifecycle_v2`, `market_positions`) — see [`docs/strategy-kalshi-mm.md`](strategy-kalshi-mm.md).
+4. **Kalshi WS gap handling.** On a `seq` gap, resubscribe and consume the fresh snapshot. Transform resets `OrderBookState`, seeds from the snapshot. Standard pattern but worth implementing and testing with synthetic gaps.
+5. **Schema versioning.** Additive-only changes to event dataclasses for now. Breaking changes go in a new `v=N/` silver partition. Revisit if a schema change can't be additive.
+6. **When to reintroduce Kinesis.** Triggers: a second independent consumer becomes real, the strategy must survive ingester restarts without dropping live events, or bronze replay latency (download + gunzip) becomes painful for development.

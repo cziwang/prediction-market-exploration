@@ -2,12 +2,11 @@
 
 ## Project overview
 
-Prediction market exploration — collecting NBA game data and Kalshi prediction market data for analysis and backtesting quantitative sports betting strategies.
+Prediction market exploration — collecting Kalshi prediction market data for analysis and backtesting quantitative sports betting strategies, with a live market making strategy on KXNBAPTS (player points) contracts.
 
-Three tracks:
-- **Batch fetchers** (done) — one-shot scripts that pull historical NBA + Kalshi data into `s3://prediction-markets-data/{nba_cdn,kalshi}/`.
-- **Live streaming** (done) — long-running per-source processes that fan raw frames to bronze (gzip-JSONL on S3) + a transform + silver (Parquet on S3), all in-process. Deployed on EC2 via systemd. Full design in [`docs/data-flow.md`](docs/data-flow.md).
-- **Market making strategy** (Phase 1 done, Phase 2 in progress) — passive MM on KXNBAPTS player props. Phase 1 (paper trading) runs inline in the Kalshi WS process. Phase 2 (live trading) adds real order placement via REST + WS push channels for fills/ACKs. Full design in [`docs/strategy-kalshi-mm.md`](docs/strategy-kalshi-mm.md).
+Two tracks:
+- **Batch fetchers** (done) — one-shot scripts that pull historical Kalshi data into `s3://prediction-markets-data/kalshi/`.
+- **Live streaming + strategy** (Phase 1 done, Phase 2 in progress) — long-running process that fans raw WS frames to bronze (gzip-JSONL on S3) + transform + strategy + silver (Parquet on S3), all in-process. Deployed on EC2 via systemd. Full design in [`docs/data-flow.md`](docs/data-flow.md) and [`docs/strategy-kalshi-mm.md`](docs/strategy-kalshi-mm.md).
 
 ## Current status
 
@@ -21,8 +20,7 @@ Three tracks:
 app/
 ├── clients/
 │   ├── kalshi_sdk.py          # Kalshi live API via official Python SDK
-│   ├── kalshi_rest.py         # Kalshi historical API via raw HTTP (SDK doesn't support /historical/*)
-│   └── nba_cdn.py             # NBA data via REST (cdn.nba.com, no auth needed)
+│   └── kalshi_rest.py         # Kalshi historical API via raw HTTP (SDK doesn't support /historical/*)
 ├── services/
 │   ├── s3_raw.py              # Read/write raw JSON to S3, deterministic keys for dedup (batch)
 │   ├── bronze_writer.py       # Async batched gzip-JSONL writer → bronze/{source}/{channel}/... (live)
@@ -33,23 +31,15 @@ app/
 ├── strategy/
 │   └── mm.py                  # MM strategy: order state machine, quoting logic, paper fill sim
 └── core/
-    └── config.py              # S3_BUCKET, SERIES, SILVER_VERSION, env vars via dotenv
+    └── config.py              # S3_BUCKET, SILVER_VERSION, env vars via dotenv
 scripts/
-├── nba_cdn/                   # NBA data (cdn.nba.com) — batch + historical
-│   ├── fetch_schedule.py      # Full season schedule → nba_cdn/schedule/
-│   ├── fetch_scoreboard.py    # Today's scoreboard → nba_cdn/scoreboard/
-│   ├── fetch_odds.py          # Today's odds → nba_cdn/odds/
-│   ├── fetch_boxscores.py     # Box scores (today or --season) → nba_cdn/boxscore/
-│   └── fetch_play_by_play.py  # PBP (today or --season) → nba_cdn/play_by_play/
 ├── kalshi/                    # Kalshi historical data
-│   ├── fetch_historical_markets.py       # All NBA series markets → kalshi/historical_markets/
+│   ├── fetch_historical_markets.py       # All series markets → kalshi/historical_markets/
 │   ├── fetch_historical_trades.py        # Trades per market → kalshi/historical_trades/
 │   └── fetch_historical_candlesticks.py  # OHLC per market → kalshi/historical_candlesticks/{interval}m/
-├── live/                      # Live ingesters, deployed on EC2 via systemd
-│   ├── kalshi_ws/             # Kalshi WS → bronze + transform + strategy + silver
-│   │   └── __main__.py        #   Subscribes to orderbook_delta + trade for 4 NBA series
-│   └── nba_cdn/               # NBA polling → bronze + silver
-│       └── __main__.py        #   Polls scoreboard, odds, PBP, boxscore
+├── live/                      # Live ingester, deployed on EC2 via systemd
+│   └── kalshi_ws/             # Kalshi WS → bronze + transform + strategy + silver
+│       └── __main__.py        #   Subscribes to orderbook_delta + trade for 4 series
 ├── materialize/               # (planned) rebuild silver from bronze after transform changes
 └── infra/
     └── smoke_test.py          # End-to-end test of BronzeWriter + SilverWriter against real S3
@@ -61,11 +51,9 @@ tests/
 └── integration/
     └── test_paper_e2e.py      # Full pipeline with fixture frames, conn_id transitions
 notebooks/
-├── nba_eda.ipynb              # EDA notebook for NBA game data
 └── strategies/
     ├── market_making.ipynb    # MM simulation + backtesting on historical data
     ├── order_book.ipynb       # Order book analysis
-    ├── prop_staleness.ipynb   # Player prop staleness analysis
     └── cross_market_arb.ipynb # Cross-market arbitrage exploration
 docs/
 ├── data-flow.md               # Live pipeline architecture (bronze/silver/transform/strategy)
@@ -74,7 +62,7 @@ docs/
 ├── deploy-mm-live.md          # Phase 2 live trading deployment
 ├── ec2-bootstrap.md           # EC2 instance setup
 ├── live-kalshi-ws-service.md  # Kalshi WS systemd service
-└── live-nba-cdn-service.md    # NBA CDN systemd service
+└── study-guide.md             # Self-paced study guide
 ```
 
 ## S3 data layout
@@ -83,26 +71,17 @@ All data stored in `s3://prediction-markets-data/`:
 
 ```
 # Batch fetchers — raw JSON, deterministic keys
-nba_cdn/                       # From cdn.nba.com REST
-  schedule/season_{year}.json
-  scoreboard/{date}.json
-  odds/{date}.json
-  boxscore/{game_id}.json
-  play_by_play/{game_id}.json
-
 kalshi/                        # From Kalshi REST API
   historical_markets/{series}.json
   historical_trades/{ticker}.json
   historical_candlesticks/{interval}m/{ticker}.json
 
 # Live streaming — written by BronzeWriter / SilverWriter
-bronze/{source}/{channel}/YYYY/MM/DD/HH/{uuid}.jsonl.gz
-silver/{source}/{EventType}/date=YYYY-MM-DD/v=N/part-{uuid}.parquet
+bronze/kalshi_ws/{channel}/YYYY/MM/DD/HH/{uuid}.jsonl.gz
+silver/kalshi_ws/{EventType}/date=YYYY-MM-DD/v=N/part-{uuid}.parquet
 ```
 
-Top-level prefix differentiates origin: `nba_cdn/`, `kalshi/` for batch; `bronze/`, `silver/` for live.
-
-## Kalshi NBA series
+## Kalshi series
 
 ```
 KXNBAGAME      — win/loss
@@ -114,7 +93,7 @@ KXNBAAST       — player assists
 KXNBA3PT       — player threes
 KXNBABLK       — player blocks
 KXNBASTL       — player steals
-KXNBA          — NBA Finals winner
+KXNBA          — Finals winner
 KXNBASERIES    — playoff series winner
 KXNBAPLAYOFF   — playoff qualifier
 KXNBAALLSTAR   — all-star game
@@ -132,7 +111,6 @@ The series list is defined in `scripts/kalshi/fetch_historical_markets.py::ALL_N
 - **Two markets per game**: Kalshi win/loss markets have one market per team (linked by `event_ticker`).
 
 ### Live streaming
-- **One live process per source**: each owns its wire connection, BronzeWriter, transform, strategy, SilverWriter. A Kalshi reconnect storm can't restart the NBA poller.
 - **Single transform execution site**: `transform()` runs once, inline in the live process. Its output simultaneously feeds the strategy and is serialized to silver. Backtest ↔ live parity is structural, not disciplinary.
 - **Bronze is authoritative**: raw bytes on S3 are the permanent archive. Silver is rebuildable from bronze via `scripts/materialize/` whenever the transform changes.
 - **Async writers**: `BronzeWriter` and `SilverWriter` are async context managers that buffer in memory, flush on size/time, and drain on shutdown. `emit()` is fire-and-forget; the WS reader never blocks on S3.
@@ -150,15 +128,6 @@ The series list is defined in `scripts/kalshi/fetch_historical_markets.py::ALL_N
 ```bash
 source .venv/bin/activate
 
-# NBA data (cdn.nba.com)
-python -m scripts.nba_cdn.fetch_schedule                            # full season schedule
-python -m scripts.nba_cdn.fetch_scoreboard                          # today's scoreboard
-python -m scripts.nba_cdn.fetch_odds                                # today's odds
-python -m scripts.nba_cdn.fetch_boxscores                           # today's box scores
-python -m scripts.nba_cdn.fetch_boxscores --season 2025-26          # backfill season
-python -m scripts.nba_cdn.fetch_play_by_play                        # today's PBP
-python -m scripts.nba_cdn.fetch_play_by_play --season 2025-26       # backfill season
-
 # Kalshi historical data (markets first, then trades + candlesticks)
 python -m scripts.kalshi.fetch_historical_markets
 python -m scripts.kalshi.fetch_historical_trades --workers 4
@@ -167,7 +136,6 @@ python -m scripts.kalshi.fetch_historical_candlesticks --workers 4 --interval 60
 # Live streaming
 python -m scripts.infra.smoke_test                                  # end-to-end BronzeWriter + SilverWriter test
 python -m scripts.live.kalshi_ws                                    # Kalshi WS → bronze + transform + silver
-python -m scripts.live.nba_cdn                                      # NBA CDN → bronze + silver
 MM_ENABLED=1 python -m scripts.live.kalshi_ws                       # with paper trading strategy
 
 # Tests
@@ -176,7 +144,6 @@ python -m pytest tests/ -v                                          # all tests 
 
 ## Data coverage
 
-- **NBA game data**: All data sourced from cdn.nba.com. Schedule endpoint only serves current season.
 - **Kalshi historical markets**: April 2025 – February 2026 (when Kalshi first launched NBA markets through the historical cutoff). ~54k markets across all series.
 - **Kalshi historical cutoff**: ~Feb 16, 2026. Data before this date is in `/historical/*` endpoints. After is in live endpoints.
 

@@ -1,12 +1,10 @@
 # EC2 bootstrap for live ingesters
 
-One-time setup for the EC2 instance that hosts the live ingesters
-(`scripts/live/nba_cdn/`, `scripts/live/kalshi_ws/`). Covers the
-instance itself, OS-level dependencies, Python venv, and AWS CLI.
-Service-specific install steps (systemd unit files, credentials) live
-in each service's own doc:
+One-time setup for the EC2 instance that hosts the live ingester
+(`scripts/live/kalshi_ws/`). Covers the instance itself, OS-level
+dependencies, Python venv, and AWS CLI. Service-specific install steps
+(systemd unit file, credentials) live in the service doc:
 
-- [`live-nba-cdn-service.md`](live-nba-cdn-service.md) — NBA CDN ingester
 - [`live-kalshi-ws-service.md`](live-kalshi-ws-service.md) — Kalshi WS ingester
 
 This section assumes no prior Linux or AWS experience. EC2 is AWS's
@@ -22,13 +20,10 @@ storing AWS keys on disk.
 - **Instance type: `t3.micro` or `t4g.micro`** — the machine's
   CPU/memory tier. `t3` is x86_64, `t4g` is ARM (slightly cheaper).
   Either works; pick one and be consistent with the AMI architecture
-  below. ~$3/mo with free tier, ~$8/mo without. Plenty for polling a
-  handful of HTTP endpoints every few seconds and holding one Kalshi
-  WebSocket. *Current deployment: `t3.micro` (x86_64).*
+  below. ~$3/mo with free tier, ~$8/mo without. Plenty for holding
+  one Kalshi WebSocket. *Current deployment: `t3.micro` (x86_64).*
 - **Region: `us-east-1`** — which AWS data center hosts the machine.
-  NBA's CDN is fronted by CloudFront with edge nodes near Virginia,
-  and Kalshi's API is also east-coast-hosted, so `us-east-1` gets
-  10–30 ms RTT to both.
+  Kalshi's API is east-coast-hosted, so `us-east-1` gets low latency.
 - **AMI: Ubuntu 24.04 LTS** — the OS image the machine boots from.
   Match the architecture to the instance type (x86_64 AMI for `t3`,
   ARM AMI for `t4g`).
@@ -102,9 +97,8 @@ sudo snap install aws-cli --classic
 # the role isn't attached to the instance yet.
 aws sts get-caller-identity
 
-# Should list the top-level prefixes (kalshi/, nba/, nba_cdn/,
-# bronze/). AccessDenied means the role's policy is missing S3 read
-# permissions.
+# Should list the top-level prefixes (kalshi/, bronze/, silver/).
+# AccessDenied means the role's policy is missing S3 read permissions.
 aws s3 ls s3://prediction-markets-data/
 ```
 
@@ -123,12 +117,7 @@ AWS credentials or network, not ingester code.
 
 ## Next steps
 
-Pick a service to install:
-
-- **NBA CDN ingester:** follow
-  [`live-nba-cdn-service.md`](live-nba-cdn-service.md). No extra
-  credentials needed — the instance's IAM role handles S3.
-- **Kalshi WS ingester:** follow
-  [`live-kalshi-ws-service.md`](live-kalshi-ws-service.md). Requires
-  a Kalshi API key and RSA `.pem` private key on the instance before
-  the service will start.
+Install the Kalshi WS ingester service: follow
+[`live-kalshi-ws-service.md`](live-kalshi-ws-service.md). Requires
+a Kalshi API key and RSA `.pem` private key on the instance before
+the service will start.
