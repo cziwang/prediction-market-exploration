@@ -18,28 +18,66 @@ A real-time local dashboard that:
 Your laptop
   streamlit run scripts/dashboard.py
        |
-       |-- Kalshi WS (authenticated) --> orderbook_delta, trade
-       |       Real-time book state, fills, trade stream
+       |-- Kalshi WS (single authenticated connection)
+       |       Public:  orderbook_snapshot, orderbook_delta, trade
+       |       Private: fill, user_orders, market_positions, market_lifecycle_v2
        |
-       |-- Kalshi REST (authenticated) --> place/cancel orders
-       |       Manual trading actions
+       |-- Kalshi REST (on user action only)
+       |       place_limit(), cancel(), cancel_all()
        |
-       +-- S3 (boto3) --> MMFillEvent parquet (30s cache)
-               Historical fills for P&L computation
+       +-- S3 (optional, startup only)
+               Backfill today's fills before WS connected
 ```
 
-The dashboard connects directly to Kalshi's WebSocket with your API keys. Independent of EC2 — works even if the strategy is down.
+Single authenticated WS connection carries all channels (public + private coexist). Independent of EC2 — works even if the strategy is down.
 
-## Data Flow
+## WebSocket Channels
 
-| Data | Source | Latency | Update method |
-|------|--------|---------|---------------|
-| Order book (bid/ask/depth) | Kalshi WS `orderbook_delta` | <100ms | Push via snapshot + delta |
-| Market trades | Kalshi WS `trade` | <100ms | Push |
-| Strategy fills | S3 silver `MMFillEvent` | 60s | Poll + cache |
-| Strategy positions | S3 silver (computed from fills) | 60s | Poll + cache |
-| Manual order placement | Kalshi REST | ~200ms | On user action |
-| Manual order cancellation | Kalshi REST | ~200ms | On user action |
+All data comes through a single authenticated Kalshi WS connection. No S3 polling needed.
+
+### Public channels (per-market subscription)
+
+| Channel | What it gives you | Latency |
+|---------|-------------------|---------|
+| `orderbook_snapshot` | Full book on subscribe (seed state) | One-time |
+| `orderbook_delta` | Incremental book updates | <100ms push |
+| `trade` | Every trade on subscribed tickers | <100ms push |
+
+### Private channels (global, your account only)
+
+| Channel | What it gives you | Latency |
+|---------|-------------------|---------|
+| `fill` | Your fills with price, size, fee, post-position | <100ms push |
+| `user_orders` | Order ACKs, cancellations, rejections, remaining size | <100ms push |
+| `market_positions` | Net position, entry price, cost basis, realized/unrealized P&L per ticker | <100ms push |
+| `market_lifecycle_v2` | Market open/close/settled status | Event-driven |
+
+### What each private channel provides
+
+**`fill`** — authoritative fill data:
+- `order_id`, `market_ticker`, `action` (buy/sell), `count_fp` (size), `yes_price_dollars`, `fee_cost`, `is_taker`, `post_position_fp`, `ts_ms`
+
+**`user_orders`** — order state machine:
+- `order_id`, `client_order_id`, `market_ticker`, `status` (pending/resting/canceled/executed/rejected), `side`, `action`, `yes_price_dollars`, `remaining_count_fp`, `ts_ms`
+
+**`market_positions`** — Kalshi's authoritative position view:
+- `market_ticker`, `position_fp`, `entry_price_cents`, `cost_basis`, `realized_pnl`, `unrealized_pnl`
+
+**`market_lifecycle_v2`** — market status changes:
+- `market_ticker`, `event_type` (opened/activated/deactivated/determined/settled), `ts_ms`
+
+### Data flow (zero S3 dependency)
+
+| Data | Source | Latency |
+|------|--------|---------|
+| Order book (all levels) | WS `orderbook_snapshot` + `orderbook_delta` | <100ms |
+| Market trades | WS `trade` | <100ms |
+| Our fills | WS `fill` | <100ms |
+| Our positions + entry price + P&L | WS `market_positions` | <100ms |
+| Our resting orders | WS `user_orders` | <100ms |
+| Market open/closed status | WS `market_lifecycle_v2` | Event-driven |
+| Manual order placement | Kalshi REST | ~200ms |
+| Manual order cancellation | Kalshi REST | ~200ms |
 
 ## Views
 
@@ -102,7 +140,7 @@ YES BID          |  YES ASK
 
 ### 5. Trade feed (bottom panel)
 
-Live trade stream from WS:
+Live trade stream from WS `trade` channel:
 
 ```
 22:17:58  SELL  ATLNALEXANDERWALKER7-20  @54c  size=3
@@ -111,18 +149,25 @@ Live trade stream from WS:
 ```
 
 - All trades on subscribed tickers in real-time
-- Our fills highlighted (matched against known positions)
+- Our fills highlighted using WS `fill` channel (shows fee, is_taker, post-position)
 
-### 6. Resting orders
+### 6. Resting orders (from WS `user_orders`)
 
 ```
-Ticker                     Side   Price  Size  Status   [Cancel]
-PHXDBROOKS3-25             BID    53c    1     Resting  [X]
-OKCSGA2-40                 ASK    93c    1     Resting  [X]
+Ticker                     Side   Price  Size  Remaining  Status   [Cancel]
+PHXDBROOKS3-25             BID    53c    1     1          Resting  [X]
+OKCSGA2-40                 ASK    93c    1     1          Resting  [X]
 ```
 
-- Shows orders placed by the strategy (from WS `user_orders` if authenticated)
+- Updated in real-time via `user_orders` push (ACK, cancel, reject, fill)
 - Cancel button per order
+- Shows rejected orders with error message
+
+### 7. Market status (from WS `market_lifecycle_v2`)
+
+- Markets that become `deactivated` are grayed out in the positions table
+- Warning banner when a market is about to settle
+- Disable order placement on closed markets
 
 ## Trading Actions
 
@@ -154,35 +199,64 @@ All actions require confirmation dialog before execution.
 The dashboard maintains its own `OrderBookState` per subscribed ticker (reuse `app/transforms/kalshi_ws.py::OrderBookState`):
 
 ```python
-# Background WS thread
-books: dict[str, OrderBookState] = {}  # ticker -> live book
-recent_trades: deque[TradeEvent] = deque(maxlen=500)
+# Background WS thread — shared state (Lock-protected)
+books: dict[str, OrderBookState] = {}         # ticker -> live book
+recent_trades: deque[dict] = deque(maxlen=500) # trade feed
+fills: list[dict] = []                         # our fills this session
+positions: dict[str, dict] = {}                # ticker -> {position, entry_price, pnl, ...}
+resting_orders: dict[str, dict] = {}           # order_id -> {ticker, side, price, remaining, status}
+market_status: dict[str, str] = {}             # ticker -> "active"/"deactivated"/"settled"
 
-# On orderbook_snapshot: books[ticker] = OrderBookState.from_snapshot(msg)
-# On orderbook_delta: books[ticker].apply_delta(msg)
-# On trade: recent_trades.append(TradeEvent(...))
+# Public channel handlers:
+# orderbook_snapshot → books[ticker] = OrderBookState.from_snapshot(msg)
+# orderbook_delta   → books[ticker].apply_delta(msg)
+# trade             → recent_trades.append(msg)
+
+# Private channel handlers:
+# fill              → fills.append(msg); update positions from post_position_fp
+# user_orders       → resting_orders[order_id] = msg (upsert by status)
+# market_positions  → positions[ticker] = msg (authoritative position + P&L)
+# market_lifecycle  → market_status[ticker] = event_type
 ```
 
-The Streamlit UI reads from these dicts on each render cycle.
+The Streamlit UI reads from these dicts on each render cycle (~1-2s).
 
 ## WS Subscription
 
-Subscribe to the same channels as the EC2 ingester but only for KXNBAPTS:
+Two subscriptions on one connection:
 
 ```python
-channels = ["orderbook_delta", "trade"]
-series = ["KXNBAPTS"]
-# Subscribe to all open KXNBAPTS markets via REST lookup first
+# 1. Public channels — per-market, need ticker list
+ws.send(json.dumps({
+    "id": 1, "cmd": "subscribe",
+    "params": {
+        "channels": ["orderbook_delta", "trade"],
+        "market_tickers": open_kxnbapts_tickers,  # from REST lookup on startup
+    }
+}))
+
+# 2. Private channels — global, no ticker filter needed
+ws.send(json.dumps({
+    "id": 2, "cmd": "subscribe",
+    "params": {
+        "channels": ["fill", "user_orders", "market_positions", "market_lifecycle_v2"],
+    }
+}))
 ```
 
-Optionally subscribe to `fill` and `user_orders` (private channels) if the dashboard uses the same API key as the strategy — this would show strategy orders/fills in real-time without S3 polling.
+Private channels deliver data for your account across all markets — no need to specify tickers. This means you see fills from the EC2 strategy too (same API key).
 
 ## P&L Computation
 
-- **Strategy fills:** Loaded from S3 silver `MMFillEvent` on startup, refreshed every 30s
-- **Round-trip P&L:** FIFO pairing (reuse `mm_stats.py` logic)
-- **Positions:** Computed from fill deltas (reuse `_true_position()`)
-- **MTM P&L:** `(mid - entry) * pos` for longs, `(entry - mid) * pos` for shorts, updated in real-time from WS mid
+All real-time, no S3 dependency:
+
+- **Positions:** From WS `market_positions` channel — gives net position, entry price, cost basis, realized P&L, unrealized P&L per ticker. This is Kalshi's authoritative view.
+- **Fills:** From WS `fill` channel — each fill includes price, size, fee, and post-position. Accumulated in-memory for session history.
+- **Round-trip P&L:** FIFO pairing of accumulated fills (reuse `mm_stats.py` logic on in-memory fill list).
+- **MTM P&L:** Two sources that should agree:
+  - WS `market_positions` provides `unrealized_pnl` directly
+  - Can also compute from `(mid - entry) * pos` using live book mid from `orderbook_delta`
+- **On startup:** Optionally load today's fills from S3 silver to backfill session history before WS was connected. After that, purely WS-driven.
 
 ## File Structure
 
