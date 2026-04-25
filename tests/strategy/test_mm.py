@@ -53,6 +53,24 @@ class TestQuotingDecision:
         places = [o for o in c.order_log if o["action"].startswith("place")]
         assert len(places) == 0
 
+    def test_narrow_spread_allows_offsetting_bid_when_short(self):
+        """When short, bid should be allowed even on tight spreads to close position."""
+        s, c = _make_strategy(min_spread_cents=3)
+        s._positions["KXNBAPTS-TEST"] = -1
+        s.on_event(_book_update("KXNBAPTS-TEST", 70, 72))  # spread = 2, below min
+        places = [o for o in c.order_log if o["action"].startswith("place")]
+        assert len(places) == 1
+        assert places[0]["action"] == "place_bid"
+
+    def test_narrow_spread_allows_offsetting_ask_when_long(self):
+        """When long, ask should be allowed even on tight spreads to close position."""
+        s, c = _make_strategy(min_spread_cents=3)
+        s._positions["KXNBAPTS-TEST"] = 1
+        s.on_event(_book_update("KXNBAPTS-TEST", 70, 72))  # spread = 2, below min
+        places = [o for o in c.order_log if o["action"].startswith("place")]
+        assert len(places) == 1
+        assert places[0]["action"] == "place_ask"
+
     def test_ignores_non_kxnbapts(self):
         s, c = _make_strategy()
         s.on_event(_book_update("KXNBAGAME-TEST", 45, 50))

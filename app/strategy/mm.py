@@ -361,8 +361,11 @@ class MMStrategy:
         reason_no_ask: str | None = None
 
         if net_half_spread < self._config.min_edge_cents:
-            reason_no_bid = "spread_narrow"
-            reason_no_ask = "spread_narrow"
+            # Allow the offsetting side through on tight spreads to close positions
+            if position >= 0:  # flat or long → no need to buy more
+                reason_no_bid = "spread_narrow"
+            if position <= 0:  # flat or short → no need to sell more
+                reason_no_ask = "spread_narrow"
         if position >= self._config.max_position:
             reason_no_bid = "pos_limit"
         if position <= -self._config.max_position:
