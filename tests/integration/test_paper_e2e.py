@@ -90,7 +90,8 @@ def test_e2e_paper_trading():
         min_spread_cents=3, max_position=5, order_size=1,
         skew_cents_per_contract=0, age_skew_interval_s=0.0,
         abs_exposure_soft_limit=0, use_player_skew=False,
-        min_trades_to_quote=0,
+        min_trades_to_quote=0, use_queue_model=False,
+        use_dynamic_sizing=False,
     )
     strategy = MMStrategy(order_client=None, config=config)  # type: ignore[arg-type]
     client = PaperOrderClient(strategy)
@@ -148,7 +149,8 @@ def test_e2e_connection_change():
         min_spread_cents=3, max_position=5, order_size=1,
         skew_cents_per_contract=0, age_skew_interval_s=0.0,
         abs_exposure_soft_limit=0, use_player_skew=False,
-        min_trades_to_quote=0,
+        min_trades_to_quote=0, use_queue_model=False,
+        use_dynamic_sizing=False,
     )
     strategy = MMStrategy(order_client=None, config=config)  # type: ignore[arg-type]
     client = PaperOrderClient(strategy)

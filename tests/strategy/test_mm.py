@@ -13,6 +13,8 @@ _LEGACY_DEFAULTS = dict(
     abs_exposure_soft_limit=0,
     use_player_skew=False,
     min_trades_to_quote=0,
+    use_queue_model=False,
+    use_dynamic_sizing=False,
 )
 
 
@@ -491,6 +493,115 @@ class TestVolumeFilter:
         s.on_event(_book_update("KXNBAPTS-TEST", 45, 50))
         places = [o for o in c.order_log if o["action"].startswith("place")]
         assert len(places) == 2
+
+
+class TestQueueModel:
+    """Queue-aware fill simulation."""
+
+    def test_fill_blocked_by_queue_depth(self):
+        """Trade smaller than queue depth should not fill our order."""
+        s, c = _make_strategy(min_spread_cents=3, use_queue_model=True)
+        s.on_event(_book_update("KXNBAPTS-TEST", 45, 50))  # bid_size=10000
+        # Trade of size 1 at our bid — queue is 10000, trade doesn't reach us
+        s.on_event(_trade("KXNBAPTS-TEST", 45, "no", size=1))
+        assert s._positions.get("KXNBAPTS-TEST", 0) == 0
+
+    def test_fill_when_trade_exceeds_queue(self):
+        """Trade larger than queue depth should fill."""
+        s, c = _make_strategy(min_spread_cents=3, use_queue_model=True)
+        # Small book depth
+        s.on_event(_book_update("KXNBAPTS-TEST", 45, 50))
+        # Manually set queue_ahead to 3 on the resting order
+        for oid, info in c._resting.items():
+            if info["side"] == "bid":
+                info["queue_ahead"] = 3
+        # Trade of size 5 > queue of 3 → fill for min(1, 5-3)=1
+        s.on_event(_trade("KXNBAPTS-TEST", 45, "no", size=5))
+        assert s._positions["KXNBAPTS-TEST"] == 1
+
+    def test_queue_model_disabled(self):
+        """With use_queue_model=False, any trade at our price fills."""
+        s, c = _make_strategy(min_spread_cents=3, use_queue_model=False)
+        s.on_event(_book_update("KXNBAPTS-TEST", 45, 50))
+        s.on_event(_trade("KXNBAPTS-TEST", 45, "no", size=1))
+        assert s._positions["KXNBAPTS-TEST"] == 1
+
+
+class TestDynamicSizing:
+    """Dynamic order sizing based on spread and inventory."""
+
+    def test_disabled_returns_order_size(self):
+        s, c = _make_strategy(min_spread_cents=3, use_dynamic_sizing=False, order_size=1)
+        s.on_event(_book_update("KXNBAPTS-TEST", 30, 50))  # wide spread
+        bid = [o for o in c.order_log if o["action"] == "place_bid"]
+        assert bid[0]["size"] == 1
+
+    def test_wide_spread_flat_position_gives_max(self):
+        s, c = _make_strategy(
+            min_spread_cents=3, use_dynamic_sizing=True,
+            max_order_size=2, spread_size_threshold=6,
+        )
+        # Spread=20, flat position → spread_bonus = min((20-6)/6, 1.0) = 1.0
+        # raw = 1.0 + 1.0 = 2.0 → size=2
+        s.on_event(_book_update("KXNBAPTS-TEST", 40, 60))
+        bid = [o for o in c.order_log if o["action"] == "place_bid"]
+        assert bid[0]["size"] == 2
+
+    def test_narrow_spread_returns_one(self):
+        s, c = _make_strategy(
+            min_spread_cents=3, use_dynamic_sizing=True,
+            max_order_size=2, spread_size_threshold=6,
+        )
+        # Spread=4, below threshold → spread_bonus=0, raw=1.0 → size=1
+        s.on_event(_book_update("KXNBAPTS-TEST", 48, 52))
+        bid = [o for o in c.order_log if o["action"] == "place_bid"]
+        assert bid[0]["size"] == 1
+
+    def test_inventory_penalty_reduces_extending_side(self):
+        s, c = _make_strategy(
+            min_spread_cents=3, use_dynamic_sizing=True,
+            max_order_size=2, spread_size_threshold=6,
+        )
+        s._positions["KXNBAPTS-TEST"] = 2  # long 2
+        # Spread=20 → spread_bonus=1.0. But bidding (extending): penalty=0.25*4=1.0
+        # raw = 1.0 + 1.0 - 1.0 = 1.0 → size=1
+        s.on_event(_book_update("KXNBAPTS-TEST", 40, 60))
+        bid = [o for o in c.order_log if o["action"] == "place_bid"]
+        assert bid[0]["size"] == 1
+
+    def test_offsetting_side_gets_full_size(self):
+        s, c = _make_strategy(
+            min_spread_cents=3, use_dynamic_sizing=True,
+            max_order_size=2, spread_size_threshold=6,
+        )
+        s._positions["KXNBAPTS-TEST"] = 2  # long 2
+        # Ask side (reducing): no penalty → raw = 1.0 + 1.0 = 2.0
+        # But clamped to abs(position) = 2 → size=2
+        s.on_event(_book_update("KXNBAPTS-TEST", 40, 60))
+        ask = [o for o in c.order_log if o["action"] == "place_ask"]
+        assert ask[0]["size"] == 2
+
+    def test_reducing_side_clamped_to_position(self):
+        s, c = _make_strategy(
+            min_spread_cents=3, use_dynamic_sizing=True,
+            max_order_size=2, spread_size_threshold=6,
+        )
+        s._positions["KXNBAPTS-TEST"] = -1  # short 1
+        # Bid side (reducing short): raw=2.0 but clamped to abs(-1)=1
+        s.on_event(_book_update("KXNBAPTS-TEST", 40, 60))
+        bid = [o for o in c.order_log if o["action"] == "place_bid"]
+        assert bid[0]["size"] == 1
+
+    def test_position_limit_clamp(self):
+        s, c = _make_strategy(
+            min_spread_cents=3, use_dynamic_sizing=True,
+            max_order_size=2, spread_size_threshold=6, max_position=2,
+        )
+        s._positions["KXNBAPTS-TEST"] = 1  # 1 room left to max_position=2
+        # Bid (extending): room = 2-1 = 1 → clamp to 1
+        s.on_event(_book_update("KXNBAPTS-TEST", 40, 60))
+        bid = [o for o in c.order_log if o["action"] == "place_bid"]
+        assert bid[0]["size"] == 1
 
 
 class TestBookInvalidatedPending:

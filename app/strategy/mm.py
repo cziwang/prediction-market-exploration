@@ -54,6 +54,12 @@ class MMConfig:
     player_skew_cents_per_contract: int = 2
     # Minimum volume filter: don't quote until ticker has seen N trades
     min_trades_to_quote: int = 20  # 0 = disabled
+    # Queue-aware fill simulation: assume back-of-queue, require trade > queue depth
+    use_queue_model: bool = True
+    # Dynamic order sizing
+    use_dynamic_sizing: bool = False  # False = fixed order_size
+    max_order_size: int = 2           # hard cap on contracts per order
+    spread_size_threshold: int = 6    # spread (cents) where size=2 becomes possible
 
 
 def maker_fee_cents(price_cents: int) -> int:
@@ -98,6 +104,7 @@ class PaperOrderClient:
 
     def place_limit(
         self, ticker: str, side: str, price_cents: int, size: int, t: float,
+        queue_ahead: int = 0,
     ) -> str:
         order_id = f"paper-{self._next_id}"
         self._next_id += 1
@@ -106,6 +113,7 @@ class PaperOrderClient:
             "side": side,
             "price": price_cents,
             "remaining": size,
+            "queue_ahead": queue_ahead,
         }
         self.order_log.append({
             "t": t, "action": f"place_{side}", "ticker": ticker,
@@ -125,6 +133,7 @@ class PaperOrderClient:
 
     def check_fill(self, trade: TradeEvent) -> None:
         """Match a trade against resting orders. Called on every TradeEvent."""
+        use_queue = self._strategy._config.use_queue_model
         for oid in list(self._resting):
             info = self._resting.get(oid)
             if info is None or info["ticker"] != trade.market_ticker:
@@ -132,7 +141,11 @@ class PaperOrderClient:
             # Buy order filled when taker sells YES (taker_side=="no") at our bid
             if (info["side"] == "bid" and trade.side == "no"
                     and trade.price == info["price"]):
-                fill_size = min(info["remaining"], trade.size)
+                queue = info.get("queue_ahead", 0) if use_queue else 0
+                available = trade.size - queue
+                if available <= 0:
+                    continue
+                fill_size = min(info["remaining"], available)
                 info["remaining"] -= fill_size
                 if info["remaining"] <= 0:
                     del self._resting[oid]
@@ -145,7 +158,11 @@ class PaperOrderClient:
             # Sell order filled when taker buys YES (taker_side=="yes") at our ask
             if (info["side"] == "ask" and trade.side == "yes"
                     and trade.price == info["price"]):
-                fill_size = min(info["remaining"], trade.size)
+                queue = info.get("queue_ahead", 0) if use_queue else 0
+                available = trade.size - queue
+                if available <= 0:
+                    continue
+                fill_size = min(info["remaining"], available)
                 info["remaining"] -= fill_size
                 if info["remaining"] <= 0:
                     del self._resting[oid]
@@ -472,8 +489,8 @@ class MMStrategy:
                 reason_no_ask=reason_no_ask,
             ))
 
-        self._maybe_update_side(ticker, "bid", desired_bid, update.t_receipt)
-        self._maybe_update_side(ticker, "ask", desired_ask, update.t_receipt)
+        self._maybe_update_side(ticker, "bid", desired_bid, update.t_receipt, update)
+        self._maybe_update_side(ticker, "ask", desired_ask, update.t_receipt, update)
 
     def _on_trade(self, trade: TradeEvent) -> None:
         if not trade.market_ticker.startswith(self._config.series_filter):
@@ -498,8 +515,48 @@ class MMStrategy:
                 state.price = None
         self._last_quote.pop(ticker, None)
 
+    def _compute_order_size(
+        self, ticker: str, side: str, position: int,
+        update: OrderBookUpdate,
+    ) -> int:
+        """Compute order size based on spread, inventory, and position limits."""
+        cfg = self._config
+        if not cfg.use_dynamic_sizing:
+            return cfg.order_size
+
+        spread = update.ask_yes - update.bid_yes
+        is_extending = (side == "bid" and position > 0) or (
+            side == "ask" and position < 0
+        )
+        is_reducing = (side == "bid" and position < 0) or (
+            side == "ask" and position > 0
+        )
+
+        # Spread bonus: linear ramp above threshold, cap at +1 contract
+        spread_bonus = max(
+            0.0, (spread - cfg.spread_size_threshold) / cfg.spread_size_threshold
+        )
+        spread_bonus = min(spread_bonus, 1.0)
+
+        # Quadratic inventory penalty when extending position
+        penalty = 0.25 * position ** 2 if is_extending else 0.0
+
+        raw = 1.0 + spread_bonus - penalty
+        size = max(1, min(int(raw), cfg.max_order_size))
+
+        # Never exceed position limit
+        room = cfg.max_position - abs(position)
+        size = min(size, max(room, 0))
+
+        # Never overshoot on reducing side
+        if is_reducing:
+            size = min(size, abs(position))
+
+        return max(1, size)
+
     def _maybe_update_side(
         self, ticker: str, side: str, price: int | None, t: float,
+        update: OrderBookUpdate | None = None,
     ) -> None:
         state = self._get_side(ticker, side)
 
@@ -511,11 +568,23 @@ class MMStrategy:
             return
 
         if state.state == "idle":
+            position = self._positions.get(ticker, 0)
+            size = (
+                self._compute_order_size(ticker, side, position, update)
+                if update is not None
+                else self._config.order_size
+            )
+            # Queue depth: contracts ahead of us at our price level
+            queue_ahead = 0
+            if update is not None:
+                queue_ahead = (
+                    update.bid_size if side == "bid" else update.ask_size
+                )
             state.state = "pending"
             state.price = price
-            state.remaining_size = self._config.order_size
+            state.remaining_size = size
             self._client.place_limit(
-                ticker, side, price, self._config.order_size, t,
+                ticker, side, price, size, t, queue_ahead=queue_ahead,
             )
         elif state.state == "resting" and state.price != price:
             # Price changed — cancel, will re-place on next update
