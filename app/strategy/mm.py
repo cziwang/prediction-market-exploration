@@ -54,8 +54,9 @@ class MMConfig:
     player_skew_cents_per_contract: int = 2
     # Minimum volume filter: don't quote until ticker has seen N trades
     min_trades_to_quote: int = 20  # 0 = disabled
-    # Queue-aware fill simulation: assume back-of-queue, require trade > queue depth
+    # Queue-aware fill simulation: only fill when trade exceeds estimated queue ahead
     use_queue_model: bool = True
+    queue_ahead_cap: int = 4  # max contracts assumed ahead of us (caps raw book depth)
     # Dynamic order sizing
     use_dynamic_sizing: bool = False  # False = fixed order_size
     max_order_size: int = 2           # hard cap on contracts per order
@@ -574,11 +575,11 @@ class MMStrategy:
                 if update is not None
                 else self._config.order_size
             )
-            # Queue depth: contracts ahead of us at our price level
+            # Queue depth: contracts ahead of us, capped to avoid over-conservatism
             queue_ahead = 0
             if update is not None:
-                queue_ahead = (
-                    update.bid_size if side == "bid" else update.ask_size
+                raw_depth = update.bid_size if side == "bid" else update.ask_size
+                queue_ahead = min(raw_depth, self._config.queue_ahead_cap
                 )
             state.state = "pending"
             state.price = price

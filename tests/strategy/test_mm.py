@@ -14,6 +14,7 @@ _LEGACY_DEFAULTS = dict(
     use_player_skew=False,
     min_trades_to_quote=0,
     use_queue_model=False,
+    queue_ahead_cap=0,
     use_dynamic_sizing=False,
 )
 
@@ -500,21 +501,16 @@ class TestQueueModel:
 
     def test_fill_blocked_by_queue_depth(self):
         """Trade smaller than queue depth should not fill our order."""
-        s, c = _make_strategy(min_spread_cents=3, use_queue_model=True)
-        s.on_event(_book_update("KXNBAPTS-TEST", 45, 50))  # bid_size=10000
-        # Trade of size 1 at our bid — queue is 10000, trade doesn't reach us
-        s.on_event(_trade("KXNBAPTS-TEST", 45, "no", size=1))
+        s, c = _make_strategy(min_spread_cents=3, use_queue_model=True, queue_ahead_cap=10)
+        s.on_event(_book_update("KXNBAPTS-TEST", 45, 50))  # bid_size=10000 → capped to 10
+        # Trade of size 5 at our bid — queue is 10, trade doesn't reach us
+        s.on_event(_trade("KXNBAPTS-TEST", 45, "no", size=5))
         assert s._positions.get("KXNBAPTS-TEST", 0) == 0
 
     def test_fill_when_trade_exceeds_queue(self):
-        """Trade larger than queue depth should fill."""
-        s, c = _make_strategy(min_spread_cents=3, use_queue_model=True)
-        # Small book depth
-        s.on_event(_book_update("KXNBAPTS-TEST", 45, 50))
-        # Manually set queue_ahead to 3 on the resting order
-        for oid, info in c._resting.items():
-            if info["side"] == "bid":
-                info["queue_ahead"] = 3
+        """Trade larger than capped queue depth should fill."""
+        s, c = _make_strategy(min_spread_cents=3, use_queue_model=True, queue_ahead_cap=3)
+        s.on_event(_book_update("KXNBAPTS-TEST", 45, 50))  # queue capped at 3
         # Trade of size 5 > queue of 3 → fill for min(1, 5-3)=1
         s.on_event(_trade("KXNBAPTS-TEST", 45, "no", size=5))
         assert s._positions["KXNBAPTS-TEST"] == 1
