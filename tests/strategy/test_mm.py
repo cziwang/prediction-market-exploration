@@ -223,6 +223,67 @@ class TestMakerFee:
             assert maker_fee_cents(p) == maker_fee_cents(100 - p)
 
 
+class TestAggregateSkew:
+    def test_agg_skew_widens_ask_when_net_short(self):
+        """At -7 net, ask should be widened by 1c (1 step past threshold=5)."""
+        s, c = _make_strategy(min_spread_cents=3, agg_skew_threshold=5, agg_skew_max=15)
+        s._agg_net_position = -7
+        s.on_event(_book_update("KXNBAPTS-TEST", 45, 50))
+        ask_place = [o for o in c.order_log if o["action"] == "place_ask"]
+        assert len(ask_place) == 1
+        assert ask_place[0]["price"] == 51  # widened by 1c
+
+    def test_agg_skew_suppresses_ask_at_max(self):
+        """At -15 net, asks should be suppressed entirely."""
+        s, c = _make_strategy(min_spread_cents=3, agg_skew_threshold=5, agg_skew_max=15)
+        s._agg_net_position = -15
+        s.on_event(_book_update("KXNBAPTS-TEST", 45, 50))
+        places = [o for o in c.order_log if o["action"].startswith("place")]
+        assert len(places) == 1
+        assert places[0]["action"] == "place_bid"
+
+    def test_agg_skew_widens_bid_when_net_long(self):
+        """At +7 net, bid should be widened by 1c."""
+        s, c = _make_strategy(min_spread_cents=3, agg_skew_threshold=5, agg_skew_max=15)
+        s._agg_net_position = 7
+        s.on_event(_book_update("KXNBAPTS-TEST", 45, 50))
+        bid_place = [o for o in c.order_log if o["action"] == "place_bid"]
+        assert len(bid_place) == 1
+        assert bid_place[0]["price"] == 44  # widened by 1c
+
+    def test_agg_skew_stacks_with_per_ticker(self):
+        """Per-ticker skew + aggregate skew should both apply."""
+        s, c = _make_strategy(
+            min_spread_cents=3, skew_threshold=2,
+            agg_skew_threshold=5, agg_skew_max=15,
+        )
+        s._positions["KXNBAPTS-TEST"] = -3  # triggers per-ticker: ask +1c
+        s._agg_net_position = -7             # triggers agg: ask +1c
+        s.on_event(_book_update("KXNBAPTS-TEST", 45, 50))
+        ask_place = [o for o in c.order_log if o["action"] == "place_ask"]
+        assert len(ask_place) == 1
+        assert ask_place[0]["price"] == 52  # 50 + 1 (per-ticker) + 1 (agg)
+
+    def test_agg_skew_updates_on_fill(self):
+        """Selling should decrement _agg_net_position."""
+        s, c = _make_strategy(min_spread_cents=3)
+        s.on_event(_book_update("KXNBAPTS-TEST", 45, 50))
+        assert s._agg_net_position == 0
+        # Sell fill
+        s.on_event(_trade("KXNBAPTS-TEST", 50, "yes"))
+        assert s._agg_net_position == -1
+
+    def test_no_agg_skew_below_threshold(self):
+        """At -3 net (below threshold=5), quotes should be normal."""
+        s, c = _make_strategy(min_spread_cents=3, agg_skew_threshold=5, agg_skew_max=15)
+        s._agg_net_position = -3
+        s.on_event(_book_update("KXNBAPTS-TEST", 45, 50))
+        bid_place = [o for o in c.order_log if o["action"] == "place_bid"]
+        ask_place = [o for o in c.order_log if o["action"] == "place_ask"]
+        assert len(bid_place) == 1 and bid_place[0]["price"] == 45
+        assert len(ask_place) == 1 and ask_place[0]["price"] == 50
+
+
 class TestBookInvalidatedPending:
     def test_pending_state_resets_to_idle_without_cancel(self):
         """When a book is invalidated while an order is pending (no ACK yet),

@@ -32,6 +32,11 @@ class MMConfig:
     skew_threshold: int = 3
     order_size: int = 1
     series_filter: str = "KXNBAPTS-"
+    # Aggregate directional skew
+    agg_skew_threshold: int = 5   # start widening overexposed side at this |net|
+    agg_skew_max: int = 15        # stop quoting overexposed side at this |net|
+    agg_skew_step_size: int = 5   # net positions per widening tier
+    agg_skew_step_cents: int = 1  # cents to widen per tier
 
 
 def maker_fee_cents(price_cents: int) -> int:
@@ -151,6 +156,7 @@ class MMStrategy:
         self._config = config or MMConfig()
         self._positions: dict[str, int] = {}
         self._aggregate_abs_position: int = 0
+        self._agg_net_position: int = 0
         # ticker → {"bid": OrderSideState, "ask": OrderSideState}
         self._order_state: dict[str, dict[str, OrderSideState]] = {}
         # Last emitted quote per ticker (for change-detection)
@@ -197,6 +203,7 @@ class MMStrategy:
         pos_after = pos_before + delta
         self._positions[ticker] = pos_after
         self._aggregate_abs_position = sum(abs(v) for v in self._positions.values())
+        self._agg_net_position = sum(self._positions.values())
 
         state = self._get_side(ticker, side)
         state.remaining_size = remaining_size
@@ -228,6 +235,31 @@ class MMStrategy:
                 "ask": OrderSideState(),
             }
         return self._order_state[ticker][side]
+
+    def _agg_skew_adjustment(self) -> tuple[int, int, bool, bool]:
+        """Aggregate directional skew: (bid_adj, ask_adj, suppress_bid, suppress_ask).
+
+        bid_adj/ask_adj: cents to widen (positive = less aggressive).
+        suppress_bid/suppress_ask: stop quoting that side entirely.
+        """
+        net = self._agg_net_position
+        cfg = self._config
+        bid_adj, ask_adj = 0, 0
+        suppress_bid, suppress_ask = False, False
+
+        if net <= -cfg.agg_skew_max:
+            suppress_ask = True
+        elif net <= -cfg.agg_skew_threshold:
+            steps = (-net - cfg.agg_skew_threshold) // cfg.agg_skew_step_size + 1
+            ask_adj = steps * cfg.agg_skew_step_cents
+
+        if net >= cfg.agg_skew_max:
+            suppress_bid = True
+        elif net >= cfg.agg_skew_threshold:
+            steps = (net - cfg.agg_skew_threshold) // cfg.agg_skew_step_size + 1
+            bid_adj = steps * cfg.agg_skew_step_cents
+
+        return bid_adj, ask_adj, suppress_bid, suppress_ask
 
     def _on_book_update(self, update: OrderBookUpdate) -> None:
         ticker = update.market_ticker
@@ -271,6 +303,20 @@ class MMStrategy:
             bid_price = max(1, bid_price - 1)
         elif position < -self._config.skew_threshold:
             ask_price = min(99, ask_price + 1)
+
+        # Aggregate directional skew
+        bid_adj, ask_adj, suppress_bid, suppress_ask = self._agg_skew_adjustment()
+        if suppress_bid:
+            reason_no_bid = reason_no_bid or "agg_skew"
+        elif bid_adj > 0:
+            bid_price = max(1, bid_price - bid_adj)
+        if suppress_ask:
+            reason_no_ask = reason_no_ask or "agg_skew"
+        elif ask_adj > 0:
+            ask_price = min(99, ask_price + ask_adj)
+
+        should_bid = reason_no_bid is None
+        should_ask = reason_no_ask is None
 
         desired_bid = bid_price if should_bid else None
         desired_ask = ask_price if should_ask else None
