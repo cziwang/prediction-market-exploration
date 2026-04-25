@@ -207,12 +207,12 @@ def _lookup_markets(tickers: list[str]) -> dict[str, dict]:
             resp.raise_for_status()
             m = resp.json().get("market", {})
             result = m.get("result")
-            yes_bid = m.get("yes_bid")
-            yes_ask = m.get("yes_ask")
+            yes_bid_d = m.get("yes_bid_dollars")
+            yes_ask_d = m.get("yes_ask_dollars")
             results[ticker] = {
                 "result": result if result in ("yes", "no") else None,
-                "yes_bid": int(yes_bid) if yes_bid is not None else None,
-                "yes_ask": int(yes_ask) if yes_ask is not None else None,
+                "yes_bid": int(round(float(yes_bid_d) * 100)) if yes_bid_d is not None else None,
+                "yes_ask": int(round(float(yes_ask_d) * 100)) if yes_ask_d is not None else None,
             }
         except Exception:
             results[ticker] = {"result": None, "yes_bid": None, "yes_ask": None}
