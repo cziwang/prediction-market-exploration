@@ -264,7 +264,7 @@ async def _main() -> None:
         log.info("MM strategy enabled (paper mode): %s", config)
 
     async with BronzeWriter(source="kalshi_ws") as bronze, \
-               SilverWriter(source="kalshi_ws") as silver:
+               SilverWriter(source="kalshi_ws", flush_seconds=60) as silver:
         ingester = Ingester(
             bronze,
             transform=transform,
