@@ -171,22 +171,24 @@ def cmd_positions() -> None:
 
 
 def cmd_status() -> None:
+    import shutil
     import subprocess
-    result = subprocess.run(
-        ["systemctl", "is-active", "kalshi-live.service"],
-        capture_output=True, text=True,
-    )
-    svc_status = result.stdout.strip()
 
-    # Check for MM_ENABLED in override
-    result2 = subprocess.run(
-        ["systemctl", "cat", "kalshi-live.service"],
-        capture_output=True, text=True,
-    )
-    mm_enabled = "MM_ENABLED=1" in result2.stdout
-
-    print(f"Service:     {svc_status}")
-    print(f"MM enabled:  {'yes' if mm_enabled else 'no'}")
+    if shutil.which("systemctl"):
+        result = subprocess.run(
+            ["systemctl", "is-active", "kalshi-live.service"],
+            capture_output=True, text=True,
+        )
+        svc_status = result.stdout.strip()
+        result2 = subprocess.run(
+            ["systemctl", "cat", "kalshi-live.service"],
+            capture_output=True, text=True,
+        )
+        mm_enabled = "MM_ENABLED=1" in result2.stdout
+        print(f"Service:     {svc_status}")
+        print(f"MM enabled:  {'yes' if mm_enabled else 'no'}")
+    else:
+        print("Service:     (not on EC2, skipping systemd check)")
 
     # Latest silver files
     s3 = boto3.client("s3")
