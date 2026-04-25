@@ -108,8 +108,8 @@ def _compute_positions_df(state: DashboardState) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def main():
-    # Silent auto-refresh every 2s — no spinner, no Stop button
-    st_autorefresh(interval=2000, limit=None, key="refresh")
+    # Silent auto-refresh every 1s — no spinner, no Stop button
+    st_autorefresh(interval=1000, limit=None, key="refresh")
 
     state = _get_state()
     client = _get_client()
