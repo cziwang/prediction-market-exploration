@@ -8,3 +8,4 @@ pyarrow>=15.0
 websockets>=13.0
 cryptography>=42.0
 pytest>=8.0
+streamlit>=1.30
