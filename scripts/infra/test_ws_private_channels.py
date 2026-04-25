@@ -146,7 +146,8 @@ async def _run() -> None:
             5: "market_lifecycle_v2 (private)",
         }
         msg_types_seen: dict[str, int] = {}
-        expected_acks = set(channel_labels.keys())
+        subscribed_count = 0
+        expected_subscriptions = len(channel_labels)
 
         deadline = time.time() + LISTEN_TIMEOUT
         log.info("listening for %ds...", LISTEN_TIMEOUT)
@@ -163,12 +164,13 @@ async def _run() -> None:
             msg_type = frame.get("type", "unknown")
             msg_types_seen[msg_type] = msg_types_seen.get(msg_type, 0) + 1
 
-            if msg_type == "ok":
-                sub_id = frame.get("id")
-                ack_ids.add(sub_id)
-                label = channel_labels.get(sub_id, f"unknown (id={sub_id})")
-                log.info("  OK: subscription %s confirmed (sid=%s)",
-                         label, frame.get("sid"))
+            if msg_type == "subscribed":
+                # Kalshi confirms subscriptions with type="subscribed"
+                # (not "ok"). The sid identifies the subscription.
+                subscribed_count += 1
+                sid = frame.get("sid")
+                log.info("  SUBSCRIBED: sid=%s (%d/%d)",
+                         sid, subscribed_count, expected_subscriptions)
             elif msg_type == "error":
                 sub_id = frame.get("id")
                 error_msg = frame.get("msg", {}).get("error", str(frame))
@@ -183,10 +185,10 @@ async def _run() -> None:
                         ticker = frame["msg"].get("market_ticker", "")
                     log.info("  data: type=%s ticker=%s", msg_type, ticker)
 
-            # If all subscriptions confirmed (or errored), we can stop early
-            if ack_ids | set(error_ids.keys()) >= expected_acks:
-                # But keep listening a bit for data messages
-                if time.time() > deadline - LISTEN_TIMEOUT + 5:
+            # If all subscriptions confirmed (or errored), keep listening
+            # a few more seconds for data to confirm channels are live
+            if subscribed_count + len(error_ids) >= expected_subscriptions:
+                if time.time() > deadline - LISTEN_TIMEOUT + 10:
                     break
 
     # Summary
@@ -194,24 +196,30 @@ async def _run() -> None:
     print("RESULTS")
     print("=" * 60)
 
-    all_ok = True
-    for sub_id, label in sorted(channel_labels.items()):
-        if sub_id in ack_ids:
-            print(f"  {label}: OK")
-        elif sub_id in error_ids:
-            print(f"  {label}: FAILED — {error_ids[sub_id]}")
-            all_ok = False
-        else:
-            print(f"  {label}: NO RESPONSE")
-            all_ok = False
+    print(f"  Subscriptions confirmed: {subscribed_count}/{expected_subscriptions}")
+    if error_ids:
+        for sub_id, err in error_ids.items():
+            label = channel_labels.get(sub_id, f"id={sub_id}")
+            print(f"  FAILED: {label} — {err}")
 
     print(f"\nMessage types seen: {dict(sorted(msg_types_seen.items()))}")
 
+    # Check which data channels actually delivered messages
+    public_types = {"orderbook_snapshot", "orderbook_delta"}
+    private_types = {"fill", "user_order", "market_position",
+                     "market_lifecycle_v2", "event_lifecycle"}
+    public_seen = public_types & set(msg_types_seen)
+    private_seen = private_types & set(msg_types_seen)
+    print(f"Public data received: {public_seen or 'none'}")
+    print(f"Private data received: {private_seen or 'none (no activity — expected if no open orders/positions)'}")
+
+    all_ok = subscribed_count == expected_subscriptions and not error_ids
     if all_ok:
         print("\nSingle-connection public+private channels: WORKS")
     else:
-        print("\nSingle-connection public+private channels: DOES NOT WORK")
-        print("Phase 2 may need separate WS connections for public vs private.")
+        print("\nSingle-connection public+private channels: ISSUES DETECTED")
+        if error_ids:
+            print("Some subscriptions failed — may need separate connections.")
 
     print("=" * 60)
 
