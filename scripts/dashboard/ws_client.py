@@ -156,26 +156,32 @@ class KalshiWSClient:
                 self._state.connected = True
                 self._state.error = None
 
-            # Subscribe to public channels (per-market)
-            ws.send(json.dumps({
-                "id": 1,
-                "cmd": "subscribe",
-                "params": {
-                    "channels": PUBLIC_CHANNELS,
-                    "market_tickers": tickers,
-                },
-            }))
+            # Subscribe to public channels in batches (Kalshi limits per message)
+            msg_id = 1
+            batch_size = 50
+            for i in range(0, len(tickers), batch_size):
+                batch = tickers[i : i + batch_size]
+                ws.send(json.dumps({
+                    "id": msg_id,
+                    "cmd": "subscribe",
+                    "params": {
+                        "channels": PUBLIC_CHANNELS,
+                        "market_tickers": batch,
+                    },
+                }))
+                msg_id += 1
 
-            # Subscribe to private channels (global)
+            # Subscribe to private channels (global, no ticker filter)
             ws.send(json.dumps({
-                "id": 2,
+                "id": msg_id,
                 "cmd": "subscribe",
                 "params": {
                     "channels": PRIVATE_CHANNELS,
                 },
             }))
 
-            log.info("Subscribed to %d tickers + private channels", len(tickers))
+            log.info("Subscribed to %d tickers in %d batches + private channels",
+                     len(tickers), (len(tickers) + batch_size - 1) // batch_size)
 
             ws.recv_bufsize = 2 ** 20  # 1MB buffer
             while not self._stop.is_set():
