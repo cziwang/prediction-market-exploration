@@ -468,6 +468,21 @@ class MMStrategy:
         spread = update.ask_yes - update.bid_yes
         if spread <= 0:
             return
+
+        # Skip markets at extreme prices — effectively decided, no MM edge
+        if update.bid_yes <= 2 or update.ask_yes >= 98:
+            # Cancel any resting orders on this dead market
+            for side in ("bid", "ask"):
+                state = self._get_side(ticker, side)
+                if state.state == "resting":
+                    state.state = "cancel_pending"
+                    if self._live:
+                        self._schedule_cancel(state.order_id)
+                    else:
+                        self._client.cancel(
+                            ticker, side, state.order_id or "", update.t_receipt,
+                        )
+            return
         position = self._positions.get(ticker, 0)
 
         # Net-of-fee edge check
