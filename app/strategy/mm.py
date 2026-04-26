@@ -235,6 +235,41 @@ class MMStrategy:
         # Shutdown event for reconciliation loop
         self._shutdown = asyncio.Event()
 
+    # -- async fire-and-forget helpers (live mode) --
+
+    def _schedule_place(
+        self, ticker: str, side: str, price: int, size: int, coid: str,
+    ) -> None:
+        """Schedule an async place_limit call. On failure, reject the order."""
+        async def _do() -> None:
+            try:
+                await self._client.place_limit(
+                    ticker, side, price, size, client_order_id=coid,
+                )
+            except Exception as e:
+                log.warning("place_limit failed for %s/%s: %s", ticker, side, e)
+                self.on_order_rejected(ticker, side, str(e))
+        try:
+            asyncio.get_running_loop().create_task(_do())
+        except RuntimeError:
+            # No running loop (tests) — call sync
+            self._client.place_limit(
+                ticker, side, price, size, client_order_id=coid,
+            )
+
+    def _schedule_cancel(self, order_id: str) -> None:
+        """Schedule an async cancel call."""
+        async def _do() -> None:
+            try:
+                await self._client.cancel(order_id)
+            except Exception as e:
+                log.warning("cancel failed for %s: %s", order_id, e)
+        try:
+            asyncio.get_running_loop().create_task(_do())
+        except RuntimeError:
+            # No running loop (tests) — call sync
+            self._client.cancel(order_id)
+
     # -- state persistence --
 
     def _load_state(self) -> None:
@@ -304,7 +339,7 @@ class MMStrategy:
             state.order_id = order_id
             self._order_id_map[order_id] = (ticker, side)
             if self._live:
-                self._client.cancel(order_id)
+                self._schedule_cancel(order_id)
             else:
                 self._client.cancel(ticker, side, order_id, 0.0)
             return
@@ -577,7 +612,7 @@ class MMStrategy:
             if state.state == "resting":
                 state.state = "cancel_pending"
                 if self._live:
-                    self._client.cancel(state.order_id)
+                    self._schedule_cancel(state.order_id)
                 else:
                     self._client.cancel(
                         ticker, side, state.order_id or "", event.t_receipt,
@@ -661,9 +696,7 @@ class MMStrategy:
                 coid = str(uuid4())
                 state.client_order_id = coid
                 self._client_order_map[coid] = (ticker, side)
-                self._client.place_limit(
-                    ticker, side, price, size, client_order_id=coid,
-                )
+                self._schedule_place(ticker, side, price, size, coid)
             else:
                 # Queue depth: contracts ahead of us, capped
                 queue_ahead = 0
@@ -677,7 +710,7 @@ class MMStrategy:
             # Price changed — cancel, will re-place on next update
             state.state = "cancel_pending"
             if self._live:
-                self._client.cancel(state.order_id)
+                self._schedule_cancel(state.order_id)
             else:
                 self._client.cancel(ticker, side, state.order_id or "", t)
         # pending or cancel_pending: wait for ACK
@@ -744,7 +777,7 @@ class MMStrategy:
             if state.state == "resting":
                 state.state = "cancel_pending"
                 if self._live:
-                    self._client.cancel(state.order_id)
+                    self._schedule_cancel(state.order_id)
                 else:
                     self._client.cancel(ticker, side, state.order_id or "", 0.0)
         pos = self._positions.get(ticker, 0)
