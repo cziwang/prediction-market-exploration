@@ -14,13 +14,16 @@ if _repo not in sys.path:
     sys.path.insert(0, _repo)
 
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
 from scripts.dashboard.ws_client import DashboardState, KalshiWSClient
-from scripts.dashboard.trading import cancel_all_orders, cancel_order, flatten_position, place_order
+from scripts.dashboard.trading import (
+    cancel_all_orders, cancel_order, flatten_position, place_order,
+    fetch_positions, fetch_settlements,
+)
 
 st.set_page_config(page_title="MM Dashboard", layout="wide")
 
@@ -31,8 +34,52 @@ st.set_page_config(page_title="MM Dashboard", layout="wide")
 
 def _get_state() -> DashboardState:
     if "dash_state" not in st.session_state:
-        st.session_state.dash_state = DashboardState()
+        state = DashboardState()
+        # Seed positions and orders from REST so they're available on first render
+        _seed_from_rest(state)
+        st.session_state.dash_state = state
     return st.session_state.dash_state
+
+
+def _seed_from_rest(state: DashboardState) -> None:
+    """Fetch positions and resting orders via REST to populate state immediately."""
+    from scripts.dashboard.trading import fetch_positions, fetch_resting_orders
+    from app.transforms.kalshi_ws import _dollars_to_cents
+
+    try:
+        rest_positions = fetch_positions()
+        rest_orders = fetch_resting_orders()
+        with state.lock:
+            for mp in rest_positions:
+                ticker = mp.get("ticker", "")
+                pos = int(round(float(mp.get("position_fp", "0"))))
+                if ticker and pos != 0:
+                    state.positions[ticker] = {
+                        "ticker": ticker,
+                        "position": pos,
+                        "cost_dollars": float(mp.get("total_traded_dollars", "0")),
+                        "realized_pnl": float(mp.get("realized_pnl_dollars", "0")),
+                        "fees_paid": float(mp.get("fees_paid_dollars", "0")),
+                        "volume": 0,
+                    }
+            for o in rest_orders:
+                order_id = o.get("order_id", "")
+                if order_id:
+                    state.resting_orders[order_id] = {
+                        "order_id": order_id,
+                        "ticker": o.get("ticker", ""),
+                        "side": o.get("side", ""),
+                        "price": _dollars_to_cents(str(o.get("yes_price_dollars", "0"))),
+                        "initial_size": int(round(float(o.get("initial_count_fp", "0")))),
+                        "remaining": int(round(float(o.get("remaining_count_fp", "0")))),
+                        "fill_count": int(round(float(o.get("fill_count_fp", "0")))),
+                        "status": o.get("status", ""),
+                        "maker_fees": float(o.get("maker_fees_dollars", "0")),
+                        "taker_fees": float(o.get("taker_fees_dollars", "0")),
+                        "updated_ms": o.get("last_updated_ts_ms", 0),
+                    }
+    except Exception as e:
+        state.error = f"REST seed failed: {e}"
 
 
 def _get_client() -> KalshiWSClient:
@@ -149,7 +196,7 @@ def main():
     cols[3].metric("Fills", f"{n_fills} today")
 
     # Kill all button
-    if cols[4].button("KILL ALL", type="primary", use_container_width=True):
+    if cols[4].button("KILL ALL", type="primary", width="stretch"):
         try:
             cancel_all_orders()
             st.success("All orders cancelled")
@@ -170,15 +217,14 @@ def main():
         if pos_rows:
             import pandas as pd
             df = pd.DataFrame(pos_rows)
-            display_df = df[["Ticker", "Pos", "Entry", "Bid", "Ask", "Mid", "Spread", "MTM", "Status"]].copy()
+            display_df = df[["Ticker", "Pos", "Entry", "Bid", "Ask", "Spread", "MTM", "Status"]].copy()
             display_df["Entry"] = display_df["Entry"].apply(lambda x: f"{x}c" if x else "?")
             display_df["Bid"] = display_df["Bid"].apply(lambda x: f"{x}c" if x is not None else "?")
             display_df["Ask"] = display_df["Ask"].apply(lambda x: f"{x}c" if x is not None else "?")
-            display_df["Mid"] = display_df["Mid"].apply(lambda x: f"{x}c" if x is not None else "?")
             display_df["Spread"] = display_df["Spread"].apply(lambda x: f"{x}c" if x is not None else "?")
             display_df["MTM"] = display_df["MTM"].apply(lambda x: f"{x:+d}c")
 
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
+            st.dataframe(display_df, width="stretch", hide_index=True)
 
             # Flatten buttons
             st.caption("Flatten a position:")
@@ -257,10 +303,13 @@ def main():
     st.divider()
     with st.expander("Place Order", expanded=False):
         with state.lock:
-            all_tickers = sorted(state.subscribed_tickers)
+            all_tickers = sorted(
+                t for t in state.subscribed_tickers
+                if state.market_status.get(t, "active") == "active"
+            )
 
         row1 = st.columns([4, 1])
-        ticker = row1[0].selectbox("Ticker", all_tickers if all_tickers else ["(loading...)"])
+        ticker = row1[0].selectbox("Ticker", all_tickers if all_tickers else ["(no active tickers)"])
 
         # Show live book for selected ticker
         with state.lock:
@@ -305,6 +354,142 @@ def main():
             except Exception as e:
                 st.error(f"Order failed: {e}")
 
+    # --- P&L Summary ---
+    st.divider()
+    with st.expander("P&L Summary", expanded=False):
+        _render_pnl_summary(state)
+
+
+def _render_pnl_summary(state: DashboardState) -> None:
+    """P&L summary with timeframe selector, covering fills + open positions."""
+    import pandas as pd
+
+    # Timeframe selector
+    tf_cols = st.columns([1, 1, 1, 1])
+    timeframe = tf_cols[0].selectbox("Timeframe", ["Today", "Last 7 days", "Last 30 days", "All time", "Custom"])
+    now = datetime.now(timezone.utc)
+
+    if timeframe == "Custom":
+        start_date = tf_cols[1].date_input("Start", value=now.date() - timedelta(days=7))
+        end_date = tf_cols[2].date_input("End", value=now.date())
+        min_ts = int(datetime.combine(start_date, datetime.min.time(), tzinfo=timezone.utc).timestamp())
+        max_ts = int(datetime.combine(end_date + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc).timestamp())
+    elif timeframe == "Today":
+        min_ts = int(datetime.combine(now.date(), datetime.min.time(), tzinfo=timezone.utc).timestamp())
+        max_ts = None
+    elif timeframe == "Last 7 days":
+        min_ts = int((now - timedelta(days=7)).timestamp())
+        max_ts = None
+    elif timeframe == "Last 30 days":
+        min_ts = int((now - timedelta(days=30)).timestamp())
+        max_ts = None
+    else:  # All time
+        min_ts = None
+        max_ts = None
+
+    if tf_cols[3].button("Load P&L"):
+        try:
+            settlements = fetch_settlements(min_ts=min_ts, max_ts=max_ts)
+            positions = fetch_positions()
+            st.session_state.pnl_settlements = settlements
+            st.session_state.pnl_positions = positions
+            st.session_state.pnl_loaded = True
+        except Exception as e:
+            st.error(f"Failed to fetch P&L data: {e}")
+            return
+
+    if not st.session_state.get("pnl_loaded"):
+        st.info("Click 'Load P&L' to fetch data")
+        return
+
+    settlements = st.session_state.pnl_settlements
+    positions = st.session_state.pnl_positions
+
+    # --- Settled markets P&L ---
+    settled_rows = []
+    total_settled_pnl = 0.0
+    total_settled_fees = 0.0
+    for s in settlements:
+        result = s["market_result"]
+        yes_count = float(s["yes_count_fp"])
+        no_count = float(s["no_count_fp"])
+        yes_cost = float(s["yes_total_cost_dollars"])
+        no_cost = float(s["no_total_cost_dollars"])
+        fee = float(s["fee_cost"])
+        # Payout: winning side gets $1 per contract
+        payout = yes_count if result == "yes" else no_count
+        total_cost = yes_cost + no_cost
+        pnl = payout - total_cost - fee
+
+        total_settled_pnl += pnl
+        total_settled_fees += fee
+
+        settled_rows.append({
+            "Ticker": _short_ticker(s["ticker"]),
+            "Result": result.upper(),
+            "YES": f"{int(yes_count)}x ${yes_cost:.2f}",
+            "NO": f"{int(no_count)}x ${no_cost:.2f}",
+            "Payout": f"${payout:.2f}",
+            "Fees": f"${fee:.2f}",
+            "P&L": f"${pnl:+.2f}",
+        })
+    settled_rows.sort(key=lambda r: float(r["P&L"].replace("$", "").replace("+", "")))
+
+    # --- Open positions unrealized P&L ---
+    open_rows = []
+    total_open_pnl = 0.0
+    for p in positions:
+        ticker = p.get("ticker", "")
+        pos = int(round(float(p.get("position_fp", "0"))))
+        if pos == 0:
+            continue
+        cost = float(p.get("total_traded_dollars", "0"))
+        entry_cents = int(round(abs(cost) / abs(pos) * 100)) if pos != 0 else 0
+
+        mid = None
+        with state.lock:
+            book = state.books.get(ticker)
+        if book:
+            mid = book.mid
+
+        if mid is not None:
+            if pos > 0:
+                unrealized = (mid - entry_cents) * pos / 100
+            else:
+                unrealized = (entry_cents - mid) * abs(pos) / 100
+        else:
+            unrealized = 0.0
+
+        total_open_pnl += unrealized
+        open_rows.append({
+            "Ticker": _short_ticker(ticker),
+            "Pos": pos,
+            "Entry": f"{entry_cents}c",
+            "Mid": f"{mid}c" if mid is not None else "?",
+            "Unrealized": f"${unrealized:+.2f}",
+        })
+    open_rows.sort(key=lambda r: float(r["Unrealized"].replace("$", "").replace("+", "")))
+
+    # --- Summary metrics ---
+    total_net = total_settled_pnl + total_open_pnl
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Net P&L", f"${total_net:+.2f}")
+    m2.metric("Settled", f"${total_settled_pnl:+.2f}")
+    m3.metric("Unrealized", f"${total_open_pnl:+.2f}")
+    m4.metric("Fees", f"${total_settled_fees:.2f}")
+
+    # --- Tables ---
+    if settled_rows:
+        st.caption(f"{len(settled_rows)} settled markets")
+        df_settled = pd.DataFrame(settled_rows)
+        st.dataframe(df_settled, width="stretch", hide_index=True)
+    else:
+        st.info("No settlements in this timeframe")
+
+    if open_rows:
+        st.caption(f"{len(open_rows)} open positions")
+        df_open = pd.DataFrame(open_rows)
+        st.dataframe(df_open, width="stretch", hide_index=True)
 
 
 if __name__ == "__main__":

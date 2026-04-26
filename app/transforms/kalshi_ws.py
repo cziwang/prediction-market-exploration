@@ -23,24 +23,26 @@ MIN_SIZE = 50  # 0.5 dollars — well below any real order
 class OrderBookState:
     """In-memory order book for one ticker. Dict[int, int] = price_cents → size_cents."""
 
-    __slots__ = ("yes_book", "no_book")
+    __slots__ = ("yes_book", "no_book", "_min_size")
 
     def __init__(self) -> None:
         self.yes_book: dict[int, int] = {}
         self.no_book: dict[int, int] = {}
+        self._min_size: int = MIN_SIZE
 
     @classmethod
-    def from_snapshot(cls, msg: dict) -> "OrderBookState":
+    def from_snapshot(cls, msg: dict, min_size: int = MIN_SIZE) -> "OrderBookState":
         book = cls()
+        book._min_size = min_size
         for price_str, size_str in msg.get("yes_dollars_fp", []):
             p = _dollars_to_cents(price_str)
             s = int(round(float(size_str)))
-            if s >= MIN_SIZE:
+            if s >= min_size:
                 book.yes_book[p] = s
         for price_str, size_str in msg.get("no_dollars_fp", []):
             p = _dollars_to_cents(price_str)
             s = int(round(float(size_str)))
-            if s >= MIN_SIZE:
+            if s >= min_size:
                 book.no_book[p] = s
         return book
 
@@ -49,8 +51,9 @@ class OrderBookState:
         delta_cents = int(round(float(msg["delta_fp"])))
         side = msg["side"]
         book = self.yes_book if side == "yes" else self.no_book
+        min_size = self._min_size
         new_size = book.get(price_cents, 0) + delta_cents
-        if new_size < MIN_SIZE:
+        if new_size < min_size:
             book.pop(price_cents, None)
         else:
             book[price_cents] = new_size

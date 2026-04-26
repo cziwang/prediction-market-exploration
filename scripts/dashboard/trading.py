@@ -96,6 +96,144 @@ def cancel_all_orders() -> dict:
     return resp.json()
 
 
+def fetch_settlements(min_ts: int | None = None, max_ts: int | None = None) -> list[dict]:
+    """Fetch settlement history from Kalshi REST API."""
+    path = "/trade-api/v2/portfolio/settlements"
+    headers = _auth_headers("GET", path)
+    settlements: list[dict] = []
+    cursor = None
+    while True:
+        params: dict = {"limit": 1000}
+        if min_ts is not None:
+            params["min_ts"] = min_ts
+        if max_ts is not None:
+            params["max_ts"] = max_ts
+        if cursor:
+            params["cursor"] = cursor
+        resp = requests.get(
+            f"{REST_URL}/portfolio/settlements",
+            params=params,
+            headers=headers,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        for s in data.get("settlements") or []:
+            settlements.append(s)
+        cursor = data.get("cursor")
+        if not cursor:
+            break
+    return settlements
+
+
+def fetch_positions() -> list[dict]:
+    """Fetch all positions with non-zero size from Kalshi REST API."""
+    path = "/trade-api/v2/portfolio/positions"
+    headers = _auth_headers("GET", path)
+    positions: list[dict] = []
+    cursor = None
+    while True:
+        params: dict = {"limit": 1000, "count_filter": "position"}
+        if cursor:
+            params["cursor"] = cursor
+        resp = requests.get(
+            f"{REST_URL}/portfolio/positions",
+            params=params,
+            headers=headers,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        for mp in data.get("market_positions") or []:
+            positions.append(mp)
+        cursor = data.get("cursor")
+        if not cursor:
+            break
+    return positions
+
+
+def fetch_resting_orders() -> list[dict]:
+    """Fetch all resting orders from Kalshi REST API."""
+    path = "/trade-api/v2/portfolio/orders"
+    headers = _auth_headers("GET", path)
+    orders: list[dict] = []
+    cursor = None
+    while True:
+        params: dict = {"limit": 1000, "status": "resting"}
+        if cursor:
+            params["cursor"] = cursor
+        resp = requests.get(
+            f"{REST_URL}/portfolio/orders",
+            params=params,
+            headers=headers,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        for o in data.get("orders") or []:
+            orders.append(o)
+        cursor = data.get("cursor")
+        if not cursor:
+            break
+    return orders
+
+
+def fetch_fills(min_ts: int | None = None, max_ts: int | None = None) -> list[dict]:
+    """Fetch fill history from Kalshi REST API, optionally filtered by timestamp."""
+    path = "/trade-api/v2/portfolio/fills"
+    headers = _auth_headers("GET", path)
+    fills: list[dict] = []
+    cursor = None
+    while True:
+        params: dict = {"limit": 1000}
+        if min_ts is not None:
+            params["min_ts"] = min_ts
+        if max_ts is not None:
+            params["max_ts"] = max_ts
+        if cursor:
+            params["cursor"] = cursor
+        resp = requests.get(
+            f"{REST_URL}/portfolio/fills",
+            params=params,
+            headers=headers,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        for f in data.get("fills") or []:
+            fills.append(f)
+        cursor = data.get("cursor")
+        if not cursor:
+            break
+    return fills
+
+
+def fetch_all_positions() -> list[dict]:
+    """Fetch ALL positions (including zero/settled) from Kalshi REST API."""
+    path = "/trade-api/v2/portfolio/positions"
+    headers = _auth_headers("GET", path)
+    positions: list[dict] = []
+    cursor = None
+    while True:
+        params: dict = {"limit": 1000}
+        if cursor:
+            params["cursor"] = cursor
+        resp = requests.get(
+            f"{REST_URL}/portfolio/positions",
+            params=params,
+            headers=headers,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        for mp in data.get("market_positions") or []:
+            positions.append(mp)
+        cursor = data.get("cursor")
+        if not cursor:
+            break
+    return positions
+
+
 def flatten_position(ticker: str, position: int, best_bid: int, best_ask: int) -> dict | None:
     """Place an aggressive order to close a position.
 

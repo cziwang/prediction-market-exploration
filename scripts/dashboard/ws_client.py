@@ -206,7 +206,7 @@ class KalshiWSClient:
             if msg_type == "orderbook_snapshot":
                 ticker = msg.get("market_ticker")
                 if ticker:
-                    self._state.books[ticker] = OrderBookState.from_snapshot(msg)
+                    self._state.books[ticker] = OrderBookState.from_snapshot(msg, min_size=1)
 
             elif msg_type == "orderbook_delta":
                 ticker = msg.get("market_ticker")
@@ -225,11 +225,12 @@ class KalshiWSClient:
                     })
 
             elif msg_type == "fill":
+                fill_ticker = msg.get("market_ticker", "")
                 self._state.fills.append({
                     "t_ms": msg.get("ts_ms", 0),
                     "trade_id": msg.get("trade_id", ""),
                     "order_id": msg.get("order_id", ""),
-                    "ticker": msg.get("market_ticker", ""),
+                    "ticker": fill_ticker,
                     "action": msg.get("action", ""),
                     "side": msg.get("side", ""),
                     "price": _dollars_to_cents(str(msg.get("yes_price_dollars", "0"))),
