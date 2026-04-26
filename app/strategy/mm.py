@@ -7,18 +7,23 @@ never wall clock. This guarantees replay fidelity.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from uuid import uuid4
 
 from app.events import (
     BookInvalidated,
     Event,
+    MMCircuitBreakerEvent,
     MMFillEvent,
     MMOrderEvent,
     MMQuoteEvent,
+    MMReconcileEvent,
     OrderBookUpdate,
     TradeEvent,
 )
@@ -61,6 +66,10 @@ class MMConfig:
     use_dynamic_sizing: bool = False  # False = fixed order_size
     max_order_size: int = 2           # hard cap on contracts per order
     spread_size_threshold: int = 6    # spread (cents) where size=2 becomes possible
+    # Phase 2: live trading
+    circuit_breaker_threshold: int = 3  # consecutive REST failures before halt
+    reconcile_interval_s: float = 30.0  # REST fallback reconciliation frequency
+    pending_timeout_s: float = 5.0      # force-reset pending/cancel_pending after this
 
 
 def maker_fee_cents(price_cents: int) -> int:
@@ -81,8 +90,10 @@ class OrderSideState:
     """
     state: str = "idle"
     order_id: str | None = None
+    client_order_id: str | None = None  # Phase 2: correlate REST → WS ACK
     price: int | None = None
     remaining_size: int = 0
+    t_entered: float = 0.0              # Phase 2: when state was entered (for timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -186,9 +197,11 @@ class MMStrategy:
         self,
         order_client: PaperOrderClient,
         config: MMConfig | None = None,
+        live: bool = False,
     ) -> None:
         self._client = order_client
         self._config = config or MMConfig()
+        self._live = live
         self._positions: dict[str, int] = {}
         self._aggregate_abs_position: int = 0
         self._agg_net_position: int = 0
@@ -209,6 +222,18 @@ class MMStrategy:
         self._last_quote: dict[str, tuple[int | None, int | None]] = {}
         # Collected strategy events for the caller to emit to silver
         self.pending_events: list[Event] = []
+
+        # Phase 2: correlation tables for WS push channels
+        # client_order_id → (ticker, side) — populated at placement,
+        # consumed when user_orders ACK arrives
+        self._client_order_map: dict[str, tuple[str, str]] = {}
+        # order_id → (ticker, side) — populated at ACK,
+        # consumed by fill and cancel_ack dispatchers
+        self._order_id_map: dict[str, tuple[str, str]] = {}
+        # client_order_ids that should be cancelled as soon as ACK arrives
+        self._pending_cancel: set[str] = set()
+        # Shutdown event for reconciliation loop
+        self._shutdown = asyncio.Event()
 
     # -- state persistence --
 
@@ -244,6 +269,14 @@ class MMStrategy:
     # -- public API --
 
     def on_event(self, event: Event) -> None:
+        # Live mode: suppress quoting when circuit breaker is open
+        if self._live and hasattr(self._client, 'circuit_open') and self._client.circuit_open:
+            if isinstance(event, TradeEvent):
+                self._on_trade(event)  # still count trades
+            elif isinstance(event, BookInvalidated):
+                self._on_book_invalidated(event)  # still clean up
+            return
+
         if isinstance(event, OrderBookUpdate):
             self._on_book_update(event)
         elif isinstance(event, TradeEvent):
@@ -253,22 +286,50 @@ class MMStrategy:
 
     # -- order lifecycle callbacks (called by PaperOrderClient) --
 
-    def on_order_ack(self, ticker: str, side: str, order_id: str) -> None:
+    def on_order_ack(
+        self, ticker: str, side: str, order_id: str,
+        client_order_id: str | None = None,
+    ) -> None:
         state = self._get_side(ticker, side)
+
+        # Consume client_order_id from correlation map
+        if client_order_id:
+            self._client_order_map.pop(client_order_id, None)
+
+        # Phase 2: check if this order was marked for immediate cancel
+        # (e.g., BookInvalidated fired while order was pending)
+        if client_order_id and client_order_id in self._pending_cancel:
+            self._pending_cancel.discard(client_order_id)
+            state.state = "cancel_pending"
+            state.order_id = order_id
+            self._order_id_map[order_id] = (ticker, side)
+            if self._live:
+                self._client.cancel(order_id)
+            else:
+                self._client.cancel(ticker, side, order_id, 0.0)
+            return
+
         if state.state == "pending":
             state.state = "resting"
             state.order_id = order_id
+            self._order_id_map[order_id] = (ticker, side)
 
     def on_order_rejected(self, ticker: str, side: str, error: str) -> None:
         state = self._get_side(ticker, side)
+        if state.client_order_id:
+            self._client_order_map.pop(state.client_order_id, None)
         state.state = "idle"
         state.order_id = None
+        state.client_order_id = None
         state.price = None
 
     def on_cancel_ack(self, ticker: str, side: str) -> None:
         state = self._get_side(ticker, side)
+        if state.order_id:
+            self._order_id_map.pop(state.order_id, None)
         state.state = "idle"
         state.order_id = None
+        state.client_order_id = None
         state.price = None
 
     def on_fill(
@@ -296,8 +357,11 @@ class MMStrategy:
         state = self._get_side(ticker, side)
         state.remaining_size = remaining_size
         if remaining_size == 0:
+            if state.order_id:
+                self._order_id_map.pop(state.order_id, None)
             state.state = "idle"
             state.order_id = None
+            state.client_order_id = None
             state.price = None
 
         if self._config.state_path is not None:
@@ -502,18 +566,29 @@ class MMStrategy:
         self._trade_counts[trade.market_ticker] = (
             self._trade_counts.get(trade.market_ticker, 0) + 1
         )
-        self._client.check_fill(trade)
+        # Live mode: fills come from WS fill channel, not trade-stream matching
+        if not self._live:
+            self._client.check_fill(trade)
 
     def _on_book_invalidated(self, event: BookInvalidated) -> None:
         ticker = event.market_ticker
         for side in ("bid", "ask"):
             state = self._get_side(ticker, side)
             if state.state == "resting":
-                self._client.cancel(
-                    ticker, side, state.order_id or "", event.t_receipt,
-                )
+                state.state = "cancel_pending"
+                if self._live:
+                    self._client.cancel(state.order_id)
+                else:
+                    self._client.cancel(
+                        ticker, side, state.order_id or "", event.t_receipt,
+                    )
             elif state.state == "pending":
-                # No order resting yet — just reset to idle
+                if self._live and state.client_order_id:
+                    # Order may still be in-flight on REST. Track
+                    # client_order_id so we cancel on ACK arrival.
+                    self._pending_cancel.add(state.client_order_id)
+                # Reset to idle (paper: ACKs are instant so safe;
+                # live: pending_cancel handles the race)
                 state.state = "idle"
                 state.order_id = None
                 state.price = None
@@ -578,20 +653,263 @@ class MMStrategy:
                 if update is not None
                 else self._config.order_size
             )
-            # Queue depth: contracts ahead of us, capped to avoid over-conservatism
-            queue_ahead = 0
-            if update is not None:
-                raw_depth = update.bid_size if side == "bid" else update.ask_size
-                queue_ahead = min(raw_depth, self._config.queue_ahead_cap
-                )
             state.state = "pending"
             state.price = price
             state.remaining_size = size
-            self._client.place_limit(
-                ticker, side, price, size, t, queue_ahead=queue_ahead,
-            )
+            state.t_entered = t
+            if self._live:
+                coid = str(uuid4())
+                state.client_order_id = coid
+                self._client_order_map[coid] = (ticker, side)
+                self._client.place_limit(
+                    ticker, side, price, size, client_order_id=coid,
+                )
+            else:
+                # Queue depth: contracts ahead of us, capped
+                queue_ahead = 0
+                if update is not None:
+                    raw_depth = update.bid_size if side == "bid" else update.ask_size
+                    queue_ahead = min(raw_depth, self._config.queue_ahead_cap)
+                self._client.place_limit(
+                    ticker, side, price, size, t, queue_ahead=queue_ahead,
+                )
         elif state.state == "resting" and state.price != price:
             # Price changed — cancel, will re-place on next update
             state.state = "cancel_pending"
-            self._client.cancel(ticker, side, state.order_id or "", t)
+            if self._live:
+                self._client.cancel(state.order_id)
+            else:
+                self._client.cancel(ticker, side, state.order_id or "", t)
         # pending or cancel_pending: wait for ACK
+
+    # -- Phase 2: live trading callbacks --
+
+    def on_ws_fill(
+        self, ticker: str, side: str, order_id: str,
+        count: int, price_cents: int, fee_cents: int,
+        is_taker: bool, post_position: int, t_ms: int,
+    ) -> None:
+        """Called by WS fill channel. Authoritative — replaces check_fill()."""
+        state = self._get_side(ticker, side)
+
+        pos_before = self._positions.get(ticker, 0)
+        self._positions[ticker] = post_position
+        self._aggregate_abs_position = sum(abs(v) for v in self._positions.values())
+        self._agg_net_position = sum(self._positions.values())
+
+        # Position age tracking
+        if pos_before == 0 and post_position != 0:
+            self._position_opened_at[ticker] = t_ms / 1000.0
+        elif post_position == 0:
+            self._position_opened_at.pop(ticker, None)
+
+        # Player-level position tracking
+        delta = post_position - pos_before
+        pk = self._player_key(ticker)
+        if pk:
+            self._player_positions[pk] = self._player_positions.get(pk, 0) + delta
+
+        # Track remaining size
+        state.remaining_size -= count
+        remaining = max(0, state.remaining_size)
+
+        if remaining == 0:
+            self._order_id_map.pop(order_id, None)
+            state.state = "idle"
+            state.order_id = None
+            state.client_order_id = None
+            state.price = None
+
+        if self._config.state_path is not None:
+            self._save_state()
+
+        self.pending_events.append(MMFillEvent(
+            t_receipt=t_ms / 1000.0,
+            market_ticker=ticker,
+            side="buy" if side == "bid" else "sell",
+            price=price_cents,
+            fill_size=count,
+            order_remaining_size=remaining,
+            position_before=pos_before,
+            position_after=post_position,
+            maker_fee=fee_cents,
+            order_id=order_id,
+            book_mid_at_fill=self._last_mid.get(ticker, 0),
+        ))
+
+    def on_market_close(self, ticker: str, event_type: str) -> None:
+        """Called when market_lifecycle_v2 signals deactivated/determined/settled."""
+        for side in ("bid", "ask"):
+            state = self._get_side(ticker, side)
+            if state.state == "resting":
+                state.state = "cancel_pending"
+                if self._live:
+                    self._client.cancel(state.order_id)
+                else:
+                    self._client.cancel(ticker, side, state.order_id or "", 0.0)
+        pos = self._positions.get(ticker, 0)
+        if pos != 0:
+            log.warning("POSITION AT %s: %s pos=%d", event_type, ticker, pos)
+
+    def on_position_update(self, ticker: str, position: int) -> None:
+        """Called by market_positions channel. Sanity check only."""
+        internal = self._positions.get(ticker, 0)
+        if internal != position:
+            log.error(
+                "POSITION DRIFT %s: internal=%d kalshi=%d",
+                ticker, internal, position,
+            )
+            old = internal
+            self._positions[ticker] = position
+            self._aggregate_abs_position = sum(
+                abs(v) for v in self._positions.values()
+            )
+            self._agg_net_position = sum(self._positions.values())
+            # Update player positions
+            delta = position - old
+            pk = self._player_key(ticker)
+            if pk:
+                self._player_positions[pk] = (
+                    self._player_positions.get(pk, 0) + delta
+                )
+            self.pending_events.append(MMReconcileEvent(
+                t_receipt=time.time(),
+                market_ticker=ticker,
+                field="position",
+                internal_value=str(old),
+                actual_value=str(position),
+                action_taken="corrected",
+            ))
+
+    async def bootstrap(self) -> None:
+        """Seed internal state from Kalshi's REST API (source of truth).
+
+        Called once at startup before processing any WS events.
+        """
+        self._positions = await self._client.get_positions()
+        api_orders = await self._client.get_open_orders()
+
+        # Cancel any orphaned orders from a prior crash
+        for order in api_orders:
+            log.info(
+                "cancelling orphan order %s from prior session", order.order_id,
+            )
+            try:
+                await self._client.cancel(order.order_id)
+            except Exception:
+                log.exception("failed to cancel orphan %s", order.order_id)
+
+        # Rebuild derived state from positions
+        self._aggregate_abs_position = sum(
+            abs(v) for v in self._positions.values()
+        )
+        self._agg_net_position = sum(self._positions.values())
+        for ticker, pos in self._positions.items():
+            pk = self._player_key(ticker)
+            if pk:
+                self._player_positions[pk] = (
+                    self._player_positions.get(pk, 0) + pos
+                )
+
+        log.info(
+            "bootstrap complete: %d positions, %d orphan orders cancelled",
+            len(self._positions), len(api_orders),
+        )
+
+    async def reconciliation_loop(self) -> None:
+        """Periodic truth-check against Kalshi's REST API.
+
+        Safety net behind WS push channels. In steady state finds zero
+        mismatches.
+        """
+        while not self._shutdown.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._shutdown.wait(),
+                    timeout=self._config.reconcile_interval_s,
+                )
+                break  # shutdown was set
+            except asyncio.TimeoutError:
+                pass
+
+            now = time.time()
+
+            # Stale pending/cancel_pending timeout
+            for ticker, sides in list(self._order_state.items()):
+                for side_name, state in sides.items():
+                    if state.state in ("pending", "cancel_pending"):
+                        if now - state.t_entered > self._config.pending_timeout_s:
+                            log.error(
+                                "STALE %s on %s/%s for %.1fs — resetting",
+                                state.state, ticker, side_name,
+                                now - state.t_entered,
+                            )
+                            if state.client_order_id:
+                                self._pending_cancel.add(state.client_order_id)
+                            state.state = "idle"
+                            state.order_id = None
+                            state.client_order_id = None
+
+            try:
+                api_positions = await self._client.get_positions()
+                api_orders = await self._client.get_open_orders()
+            except Exception as e:
+                log.warning("reconciliation failed: %s", e)
+                continue
+
+            # Diff positions
+            all_tickers = set(list(self._positions) + list(api_positions))
+            for ticker in all_tickers:
+                internal = self._positions.get(ticker, 0)
+                actual = api_positions.get(ticker, 0)
+                if internal != actual:
+                    log.error(
+                        "POSITION MISMATCH %s: internal=%d actual=%d",
+                        ticker, internal, actual,
+                    )
+                    self._positions[ticker] = actual
+                    self.pending_events.append(MMReconcileEvent(
+                        t_receipt=now,
+                        market_ticker=ticker,
+                        field="position",
+                        internal_value=str(internal),
+                        actual_value=str(actual),
+                        action_taken="corrected",
+                    ))
+
+            # Diff open orders — detect orphans
+            known_order_ids = {
+                state.order_id
+                for sides in self._order_state.values()
+                for state in sides.values()
+                if state.order_id is not None
+            }
+            for order in api_orders:
+                if order.order_id not in known_order_ids:
+                    log.warning(
+                        "ORPHAN ORDER %s on %s — cancelling",
+                        order.order_id, order.ticker,
+                    )
+                    try:
+                        await self._client.cancel(order.order_id)
+                    except Exception:
+                        log.exception(
+                            "failed to cancel orphan %s", order.order_id,
+                        )
+                    self.pending_events.append(MMReconcileEvent(
+                        t_receipt=now,
+                        market_ticker=order.ticker,
+                        field="order",
+                        internal_value="none",
+                        actual_value=order.order_id,
+                        action_taken="cancelled_orphan",
+                    ))
+
+            self._aggregate_abs_position = sum(
+                abs(v) for v in self._positions.values()
+            )
+            self._agg_net_position = sum(self._positions.values())
+
+    def stop(self) -> None:
+        """Signal shutdown for the reconciliation loop."""
+        self._shutdown.set()

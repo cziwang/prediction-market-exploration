@@ -81,7 +81,28 @@ class MMFillEvent:
     book_mid_at_fill: int
 
 
+@dataclass(frozen=True)
+class MMReconcileEvent:
+    """Emitted when the reconciliation loop detects a state mismatch."""
+    t_receipt: float
+    market_ticker: str
+    field: str                # "position" or "order"
+    internal_value: str
+    actual_value: str
+    action_taken: str         # "corrected" | "cancelled_orphan"
+
+
+@dataclass(frozen=True)
+class MMCircuitBreakerEvent:
+    """Emitted when the REST circuit breaker opens or closes."""
+    t_receipt: float
+    state: str                # "open" | "closed"
+    consecutive_failures: int
+    last_error: str | None
+
+
 Event = Union[
     OrderBookUpdate, TradeEvent,
     BookInvalidated, MMQuoteEvent, MMOrderEvent, MMFillEvent,
+    MMReconcileEvent, MMCircuitBreakerEvent,
 ]
