@@ -38,6 +38,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 HOST = "https://api.elections.kalshi.com/trade-api/v2"
+SIGN_PREFIX = "/trade-api/v2"  # Signature must include the full path from root
 MAX_ORDER_SIZE = 10  # hard safety limit
 
 log = logging.getLogger(__name__)
@@ -107,7 +108,8 @@ class KalshiOrderClient:
 
     def _auth_headers(self, method: str, path: str) -> dict[str, str]:
         timestamp_ms = str(int(time.time() * 1000))
-        signature = self._sign(timestamp_ms, method, path)
+        sign_path = SIGN_PREFIX + path
+        signature = self._sign(timestamp_ms, method, sign_path)
         return {
             "KALSHI-ACCESS-KEY": self._key_id,
             "KALSHI-ACCESS-SIGNATURE": signature,
