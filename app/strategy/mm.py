@@ -470,7 +470,7 @@ class MMStrategy:
             return
 
         # Skip markets at extreme prices — effectively decided, no MM edge
-        if update.bid_yes <= 2 or update.ask_yes >= 98:
+        if update.bid_yes <= 10 or update.ask_yes >= 90:
             # Cancel any resting orders on this dead market
             for side in ("bid", "ask"):
                 state = self._get_side(ticker, side)
