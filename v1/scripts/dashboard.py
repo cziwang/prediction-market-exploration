@@ -57,7 +57,7 @@ def _seed_from_rest(state: DashboardState) -> None:
                     state.positions[ticker] = {
                         "ticker": ticker,
                         "position": pos,
-                        "cost_dollars": float(mp.get("total_traded_dollars", "0")),
+                        "cost_dollars": float(mp.get("market_exposure_dollars", "0")),
                         "realized_pnl": float(mp.get("realized_pnl_dollars", "0")),
                         "fees_paid": float(mp.get("fees_paid_dollars", "0")),
                         "volume": 0,
@@ -153,6 +153,66 @@ def _compute_positions_df(state: DashboardState) -> list[dict]:
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=300)
+def _fetch_pnl_chart_data() -> list[dict]:
+    """Fetch fills and settlements and compute cumulative P&L events.
+
+    Cached for 5 minutes to avoid hammering the API on every 1s refresh.
+    """
+    from scripts.dashboard.trading import fetch_fills, fetch_settlements
+    fills = fetch_fills()
+    settlements = fetch_settlements()
+
+    events: list[dict] = []
+    for f in fills:
+        ts = f.get("created_time", "")
+        if not ts:
+            continue
+        count = float(f.get("count_fp", "0"))
+        fee = float(f.get("fee_cost", "0"))
+        action = f.get("action", "")
+        side = f.get("side", "yes")
+        if side == "yes":
+            price = float(f.get("yes_price_dollars", "0"))
+        else:
+            price = float(f.get("no_price_dollars", "0"))
+        if action == "buy":
+            cash = -(price * count) - fee
+        else:
+            cash = (price * count) - fee
+        events.append({"time": ts, "cash": cash})
+
+    for s in settlements:
+        result = s["market_result"]
+        yes_count = float(s["yes_count_fp"])
+        no_count = float(s["no_count_fp"])
+        payout = yes_count if result == "yes" else no_count
+        ts = s.get("settled_time") or s.get("last_updated_ts") or ""
+        if ts and payout > 0:
+            if isinstance(ts, (int, float)):
+                ts = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+            events.append({"time": ts, "cash": payout})
+
+    return events
+
+
+def _render_pnl_chart() -> None:
+    """Render cumulative P&L line chart on the main dashboard."""
+    import pandas as pd
+
+    events = _fetch_pnl_chart_data()
+    if not events:
+        return
+
+    st.subheader("Portfolio Performance")
+    df = pd.DataFrame(events)
+    df["time"] = pd.to_datetime(df["time"], utc=True)
+    df = df.sort_values("time")
+    df["Cumulative P&L ($)"] = df["cash"].cumsum()
+    df = df.set_index("time")
+    st.line_chart(df["Cumulative P&L ($)"])
+
 
 def main():
     # Silent auto-refresh every 1s — no spinner, no Stop button
@@ -299,6 +359,10 @@ def main():
             else:
                 st.info("No resting orders")
 
+    # --- Portfolio performance chart ---
+    st.divider()
+    _render_pnl_chart()
+
     # --- Trade panel (bottom) ---
     st.divider()
     with st.expander("Place Order", expanded=False):
@@ -443,7 +507,7 @@ def _render_pnl_summary(state: DashboardState) -> None:
         pos = int(round(float(p.get("position_fp", "0"))))
         if pos == 0:
             continue
-        cost = float(p.get("total_traded_dollars", "0"))
+        cost = float(p.get("market_exposure_dollars", "0"))
         entry_cents = int(round(abs(cost) / abs(pos) * 100)) if pos != 0 else 0
 
         mid = None
