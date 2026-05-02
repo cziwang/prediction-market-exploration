@@ -80,17 +80,6 @@ python -m v2.scripts.infra.setup_glue_catalog --dry-run
 python -m v2.scripts.infra.setup_glue_catalog
 ```
 
-## infra/delete_silver_v2.py
-
-**What it does:** Deletes all silver v=1 and v=2 files from S3. These are fully superseded by v=3 (backfilled from bronze). Lists all files, shows a summary, and asks for confirmation before deleting.
-
-**When to run:** Once, after confirming v=3 backfill is complete.
-
-```bash
-python -m v2.scripts.infra.delete_silver_v2 --dry-run
-python -m v2.scripts.infra.delete_silver_v2
-```
-
 ## replay/build_books.py
 
 **What it does:** Reconstructs full-depth order books from bronze `orderbook_snapshot` + `orderbook_delta` data. Replays events in sequence order and writes point-in-time book snapshots to Parquet.

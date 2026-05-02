@@ -15,12 +15,3 @@ Creates the AWS Glue Data Catalog and Athena workgroup for querying silver Parqu
 python -m v2.scripts.infra.setup_glue_catalog --dry-run
 python -m v2.scripts.infra.setup_glue_catalog
 ```
-
-## delete_silver_v2.py
-
-Deletes all silver v=1 and v=2 files from S3. These are fully superseded by v=3 (backfilled from bronze). Lists all files with sizes, asks for confirmation before deleting.
-
-```bash
-python -m v2.scripts.infra.delete_silver_v2 --dry-run
-python -m v2.scripts.infra.delete_silver_v2
-```
