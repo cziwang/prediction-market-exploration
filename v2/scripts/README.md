@@ -2,7 +2,9 @@
 
 - **live ingester** = streams Kalshi WS data to bronze + silver (v=3), runs continuously
 - **compact** = defragmentation (many small files to one big file), run daily
-- **backfill** = format conversion (v=2 to v=3), run once
+- **backfill** = re-derive silver v=3 from bronze, run after schema changes or `_parse_ts` fixes
+- **infra** = AWS Glue/Athena setup, S3 cleanup
+- **replay** = full-depth order book reconstruction from bronze for research/backtesting
 
 ## live/kalshi_ws/
 
@@ -43,20 +45,17 @@ python -m v2.scripts.compact_silver --event-type OrderBookUpdate --date 2026-04-
 
 ## backfill_silver_v3.py
 
-**Problem:** v=2 silver files are missing fields (`t_exchange`, `sid`, `seq`), use float64 timestamps, have no dictionary encoding, and no sort guarantee. v=3 needs all of these fixed.
+**What it does:** Re-derives silver v=3 from bronze data.
 
-**What it does:** Two-phase backfill depending on event type:
+1. **OrderBookUpdate / TradeEvent / BookInvalidated** — re-derived from **bronze** (raw WS frames) by replaying through `KalshiTransform`. Produces BBO-level data with `t_exchange_ns`, `sid`, and `seq`.
+2. **MM event types** (MMQuoteEvent, MMFillEvent, etc.) — if v=2 silver still exists for these, converts them to v=3 schema. Otherwise skips (v=2 has been deleted).
 
-1. **OrderBookUpdate / TradeEvent / BookInvalidated** — re-derived from **bronze** (raw WS frames) by replaying through the transform. This is the only way to get `t_exchange` (Kalshi's server timestamp), `sid` (subscription ID), and `seq` (sequence number), since v=2 silver never captured them.
-2. **MM event types** (MMQuoteEvent, MMFillEvent, etc.) — converted from **v=2 silver**. These events don't have the new fields, so null columns are added.
+Note: this produces BBO-only silver data. For full-depth order books, use `replay/build_books.py` instead.
 
-Output is already compacted (one file per date per event type).
-
-- **Reads from (bronze):** `s3://prediction-markets-data/bronze/kalshi_ws/{channel}/{Y}/{M}/{D}/{H}/*.jsonl.gz`
-- **Reads from (silver):** `s3://prediction-markets-data/silver/kalshi_ws/{EventType}/date={YYYY-MM-DD}/v=2/*.parquet`
+- **Reads from:** `s3://prediction-markets-data/bronze/kalshi_ws/{channel}/{Y}/{M}/{D}/{H}/*.jsonl.gz`
 - **Writes to:** `s3://prediction-markets-data/silver/kalshi_ws/{EventType}/date={YYYY-MM-DD}/v=3/compacted-{uuid}.parquet`
 
-**When to run:** Once, after deploying v2. Use `--delete-existing` to re-derive if v=3 already exists (e.g., after schema changes).
+**When to run:** After schema changes or bug fixes (e.g., `_parse_ts` ISO string fix). Use `--delete-existing` to re-derive dates that already have v=3.
 
 ```bash
 python -m v2.scripts.backfill_silver_v3 --dry-run
