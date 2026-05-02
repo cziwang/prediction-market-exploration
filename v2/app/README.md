@@ -37,5 +37,14 @@ What each field in the v=3 silver schema is, where it comes from, and why it mat
 
 - `clients/` — Kalshi API clients for discovering open markets
 - `core/` — Configuration (S3 bucket, silver version)
+- `replay/` — Full-depth order book reconstruction from bronze data
 - `services/` — Async S3 writers (bronze + silver)
 - `transforms/` — Stateful raw-frame-to-typed-event conversion
+
+### replay/
+
+Reconstructs full-depth order books from bronze `orderbook_snapshot` + `orderbook_delta` data. Unlike the BBO-only `OrderBookUpdate` in silver (which only stores best bid/ask), replay builds the complete book at every price level.
+
+- **`book_state.py`** — `ReplayBookState`: full-depth book for one ticker. Maintains `yes_book` and `no_book` as `dict[int, int]` (price_cents → size). Supports delta application, snapshot seeding, BBO derivation, full-depth level queries, and invariant validation (negative sizes, crossed books, price range).
+
+- **`engine.py`** — `ReplayEngine`: reads bronze S3 data for a date, replays snapshots + deltas in sequence order, and emits `BookSnapshot` objects at configurable intervals (`every_event`, `every_n`). Handles tickers that appear without a prior snapshot (creates empty book from first delta). Detects sequence gaps when replaying all tickers.

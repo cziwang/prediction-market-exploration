@@ -9,6 +9,7 @@ Integer cents throughout — no floats for prices or sizes.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 
 from v2.app.events import BookInvalidated, Event, OrderBookUpdate, TradeEvent
@@ -108,6 +109,12 @@ def _parse_ts(ts) -> float | None:
             val = float(ts)
             return val / 1000.0 if val > 1e12 else val
         except ValueError:
+            pass
+        # ISO 8601: "2026-04-26T00:29:22.803263Z"
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            return dt.timestamp()
+        except (ValueError, AttributeError):
             pass
     return None
 

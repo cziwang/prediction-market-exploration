@@ -64,3 +64,30 @@ python -m v2.scripts.backfill_silver_v3
 python -m v2.scripts.backfill_silver_v3 --event-type OrderBookUpdate
 python -m v2.scripts.backfill_silver_v3 --delete-existing    # re-derive, replacing existing v=3
 ```
+
+## infra/setup_glue_catalog.py
+
+**What it does:** Creates the AWS Glue Data Catalog database, one table per silver event type, and an Athena workgroup — all idempotent. Re-running updates existing table definitions (useful after schema changes).
+
+- **Database:** `prediction_markets`
+- **Tables:** 8 tables (`order_book_update`, `trade_event`, `book_invalidated`, `mm_quote_event`, `mm_order_event`, `mm_fill_event`, `mm_reconcile_event`, `mm_circuit_breaker_event`)
+- **Partition projection:** `date` (string, yyyy-MM-dd) + `v` (integer, 3 only) — Athena computes partitions from rules, no `MSCK REPAIR TABLE` needed
+- **Workgroup:** `prediction-markets` with 10 GB scan cutoff, results to `s3://prediction-markets-data/athena-results/`
+
+**When to run:** Once to set up, or again after silver schema changes.
+
+```bash
+python -m v2.scripts.infra.setup_glue_catalog --dry-run
+python -m v2.scripts.infra.setup_glue_catalog
+```
+
+## infra/delete_silver_v2.py
+
+**What it does:** Deletes all silver v=1 and v=2 files from S3. These are fully superseded by v=3 (backfilled from bronze). Lists all files, shows a summary, and asks for confirmation before deleting.
+
+**When to run:** Once, after confirming v=3 backfill is complete.
+
+```bash
+python -m v2.scripts.infra.delete_silver_v2 --dry-run
+python -m v2.scripts.infra.delete_silver_v2
+```
