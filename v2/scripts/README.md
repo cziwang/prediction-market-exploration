@@ -43,22 +43,24 @@ python -m v2.scripts.compact_silver --event-type OrderBookUpdate --date 2026-04-
 
 ## backfill_silver_v3.py
 
-**Problem:** v1 wrote silver files with float64 timestamps, no dictionary encoding, and no sort guarantee. v2 needs int64 nanosecond timestamps, dictionary-encoded strings, and sorted rows.
+**Problem:** v=2 silver files are missing fields (`t_exchange`, `sid`, `seq`), use float64 timestamps, have no dictionary encoding, and no sort guarantee. v=3 needs all of these fixed.
 
-**What it does:** Converts old v=2 files to v=3 format. Output is already compacted (one file per date per event type), so no need to run compact after backfill.
+**What it does:** Two-phase backfill depending on event type:
 
-- **Reads from:** `s3://prediction-markets-data/silver/kalshi_ws/{EventType}/date={YYYY-MM-DD}/v=2/*.parquet`
+1. **OrderBookUpdate / TradeEvent / BookInvalidated** — re-derived from **bronze** (raw WS frames) by replaying through the transform. This is the only way to get `t_exchange` (Kalshi's server timestamp), `sid` (subscription ID), and `seq` (sequence number), since v=2 silver never captured them.
+2. **MM event types** (MMQuoteEvent, MMFillEvent, etc.) — converted from **v=2 silver**. These events don't have the new fields, so null columns are added.
+
+Output is already compacted (one file per date per event type).
+
+- **Reads from (bronze):** `s3://prediction-markets-data/bronze/kalshi_ws/{channel}/{Y}/{M}/{D}/{H}/*.jsonl.gz`
+- **Reads from (silver):** `s3://prediction-markets-data/silver/kalshi_ws/{EventType}/date={YYYY-MM-DD}/v=2/*.parquet`
 - **Writes to:** `s3://prediction-markets-data/silver/kalshi_ws/{EventType}/date={YYYY-MM-DD}/v=3/compacted-{uuid}.parquet`
-- Converts `t_receipt` (float64 seconds) to `t_receipt_ns` (int64 nanoseconds)
-- Applies explicit Arrow schema with dictionary encoding
-- Sorts by `t_receipt_ns`
-- Skips partitions where v=3 already exists
-- Leaves v=2 files in place for backward compatibility
 
-**When to run:** Once, after deploying v2.
+**When to run:** Once, after deploying v2. Use `--delete-existing` to re-derive if v=3 already exists (e.g., after schema changes).
 
 ```bash
 python -m v2.scripts.backfill_silver_v3 --dry-run
 python -m v2.scripts.backfill_silver_v3
 python -m v2.scripts.backfill_silver_v3 --event-type OrderBookUpdate
+python -m v2.scripts.backfill_silver_v3 --delete-existing    # re-derive, replacing existing v=3
 ```

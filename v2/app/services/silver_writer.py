@@ -49,18 +49,24 @@ _dict_utf8 = pa.dictionary(pa.int16(), pa.utf8())
 SCHEMAS: dict[str, pa.Schema] = {
     "OrderBookUpdate": pa.schema([
         ("t_receipt_ns", pa.int64()),
+        ("t_exchange_ns", pa.int64()),       # nullable — None for snapshots
         ("market_ticker", _dict_utf8),
         ("bid_yes", pa.int32()),
         ("ask_yes", pa.int32()),
         ("bid_size", pa.int32()),
         ("ask_size", pa.int32()),
+        ("sid", pa.int32()),                 # nullable — subscription ID
+        ("seq", pa.int32()),                 # nullable — sequence number
     ]),
     "TradeEvent": pa.schema([
         ("t_receipt_ns", pa.int64()),
+        ("t_exchange_ns", pa.int64()),       # nullable
         ("market_ticker", _dict_utf8),
         ("side", _dict_utf8),
         ("price", pa.int32()),
         ("size", pa.int32()),
+        ("sid", pa.int32()),                 # nullable
+        ("seq", pa.int32()),                 # nullable
     ]),
     "BookInvalidated": pa.schema([
         ("t_receipt_ns", pa.int64()),
@@ -119,11 +125,14 @@ SCHEMAS: dict[str, pa.Schema] = {
 
 
 def _prepare_rows(events: list[Event]) -> list[dict]:
-    """Convert event dataclasses to dicts with t_receipt_ns (int64 ns)."""
+    """Convert event dataclasses to dicts with int64 ns timestamps."""
     rows = []
     for e in events:
         row = asdict(e)
         row["t_receipt_ns"] = int(row.pop("t_receipt") * 1_000_000_000)
+        # Convert t_exchange (float seconds | None) → t_exchange_ns (int64 | None)
+        t_ex = row.pop("t_exchange", None)
+        row["t_exchange_ns"] = int(t_ex * 1_000_000_000) if t_ex is not None else None
         rows.append(row)
     rows.sort(key=lambda r: r["t_receipt_ns"])
     return rows

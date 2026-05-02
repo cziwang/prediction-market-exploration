@@ -91,6 +91,27 @@ def _dollars_to_cents(s: str) -> int:
     return int(round(float(s) * 100))
 
 
+def _parse_ts(ts) -> float | None:
+    """Parse Kalshi's server timestamp to float seconds.
+
+    Handles: epoch int/float (seconds or ms), epoch string, ISO string, None.
+    """
+    if ts is None:
+        return None
+    if isinstance(ts, (int, float)):
+        # If > 1e12, it's milliseconds; convert to seconds
+        return ts / 1000.0 if ts > 1e12 else float(ts)
+    if isinstance(ts, str):
+        if not ts:
+            return None
+        try:
+            val = float(ts)
+            return val / 1000.0 if val > 1e12 else val
+        except ValueError:
+            pass
+    return None
+
+
 class KalshiTransform:
     """Raw WS frame → list of typed Events."""
 
@@ -113,6 +134,8 @@ class KalshiTransform:
             self._conn_id = conn_id
 
         msg_type = frame.get("type")
+        sid = frame.get("sid")
+        seq = frame.get("seq")
 
         if msg_type == "orderbook_snapshot":
             msg = frame.get("msg", {})
@@ -129,6 +152,9 @@ class KalshiTransform:
                     ask_yes=book.best_ask,
                     bid_size=book.bid_size_top,
                     ask_size=book.ask_size_top,
+                    t_exchange=None,  # snapshots don't have ts
+                    sid=sid,
+                    seq=seq,
                 ))
 
         elif msg_type == "orderbook_delta":
@@ -140,6 +166,7 @@ class KalshiTransform:
             if book is None:
                 return events
             book.apply_delta(msg)
+            t_exchange = _parse_ts(msg.get("ts"))
             if book.best_bid is not None and book.best_ask is not None:
                 events.append(OrderBookUpdate(
                     t_receipt=t_receipt,
@@ -148,6 +175,9 @@ class KalshiTransform:
                     ask_yes=book.best_ask,
                     bid_size=book.bid_size_top,
                     ask_size=book.ask_size_top,
+                    t_exchange=t_exchange,
+                    sid=sid,
+                    seq=seq,
                 ))
 
         elif msg_type == "trade":
@@ -158,6 +188,7 @@ class KalshiTransform:
             yes_price = msg.get("yes_price_dollars")
             count_fp = msg.get("count_fp")
             taker_side = msg.get("taker_side")
+            t_exchange = _parse_ts(msg.get("ts"))
             if yes_price is not None and count_fp is not None and taker_side:
                 events.append(TradeEvent(
                     t_receipt=t_receipt,
@@ -165,6 +196,9 @@ class KalshiTransform:
                     side=taker_side,
                     price=_dollars_to_cents(str(yes_price)),
                     size=int(round(float(count_fp))),
+                    t_exchange=t_exchange,
+                    sid=sid,
+                    seq=seq,
                 ))
 
         return events

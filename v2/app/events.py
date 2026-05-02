@@ -1,9 +1,12 @@
-"""Typed domain events.
+"""Typed domain events (v2).
 
-Identical to v1 — event dataclasses are the contract between the live
-pipeline (v1) and the storage/query infrastructure (v2). t_receipt stays
-as float (seconds) internally; the silver writer converts to int64
-nanoseconds at the serialization boundary.
+Extends v1 events with fields previously dropped from raw WS frames:
+- t_exchange: Kalshi's server-side timestamp (for latency measurement)
+- sid: subscription ID (correlates sequence numbers)
+- seq: sequence number (for gap detection)
+
+t_receipt and t_exchange stay as float (seconds) internally; the silver
+writer converts both to int64 nanoseconds at the serialization boundary.
 """
 
 from __future__ import annotations
@@ -20,6 +23,9 @@ class OrderBookUpdate:
     ask_yes: int
     bid_size: int
     ask_size: int
+    t_exchange: float | None = None  # Kalshi server timestamp (None for snapshots)
+    sid: int | None = None           # subscription ID
+    seq: int | None = None           # sequence number (for gap detection)
 
 
 @dataclass(frozen=True)
@@ -29,6 +35,9 @@ class TradeEvent:
     side: str
     price: int
     size: int
+    t_exchange: float | None = None  # Kalshi server timestamp
+    sid: int | None = None           # subscription ID
+    seq: int | None = None           # sequence number (for gap detection)
 
 
 @dataclass(frozen=True)
