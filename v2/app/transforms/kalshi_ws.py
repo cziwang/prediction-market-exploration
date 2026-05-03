@@ -89,15 +89,37 @@ class KalshiTransform:
             taker_side = msg.get("taker_side")
             t_exchange = parse_ts(msg.get("ts"))
             if yes_price is not None and count_fp is not None and taker_side:
+                yes_price_cents = dollars_to_cents(str(yes_price))
+                fill_size = int(round(float(count_fp)))
                 events.append(TradeEvent(
                     t_receipt=t_receipt,
                     market_ticker=ticker,
                     side=taker_side,
-                    price=dollars_to_cents(str(yes_price)),
-                    size=int(round(float(count_fp))),
+                    price=yes_price_cents,
+                    size=fill_size,
                     t_exchange=t_exchange,
                     sid=sid,
                     seq=seq,
                 ))
+
+                # Apply fill to book state — Kalshi's orderbook_delta
+                # channel does not emit deltas for matched fills, so we
+                # must decrement the consumed side ourselves.
+                book = self._books.get(ticker)
+                if book is not None:
+                    if taker_side == "yes":
+                        # YES taker consumed a resting NO order at
+                        # NO price = (100 - yes_price) cents.
+                        book.apply_delta(100 - yes_price_cents, -fill_size, "no")
+                    else:
+                        # NO taker consumed a resting YES order at
+                        # YES price = yes_price cents.
+                        book.apply_delta(yes_price_cents, -fill_size, "yes")
+                    book.seq = seq
+                    t_receipt_ns = int(t_receipt * 1_000_000_000)
+                    t_exchange_ns = int(t_exchange * 1_000_000_000) if t_exchange else None
+                    depth_rows.append(extract_depth_row(
+                        book, t_receipt_ns, t_exchange_ns, ticker, seq, sid,
+                    ))
 
         return TransformResult(events, depth_rows)
