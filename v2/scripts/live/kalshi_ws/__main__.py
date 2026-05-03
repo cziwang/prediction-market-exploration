@@ -54,6 +54,11 @@ NO_MARKETS_BACKOFF = 300.0
 WS_PING_INTERVAL = 30
 WS_PING_TIMEOUT = 10
 
+# Periodic REST-based re-snapshot to correct book drift.
+# Kalshi's orderbook_delta channel doesn't emit deltas for fills,
+# so our fill-decrement approximation drifts over time.
+SNAPSHOT_INTERVAL = 60  # seconds between re-snapshots
+
 log = logging.getLogger("live.kalshi_ws")
 
 
@@ -112,6 +117,9 @@ class Ingester:
         self._shutdown = asyncio.Event()
         self._ws: websockets.ClientConnection | None = None
         self._conn_id: str | None = None
+        self._subscribed_tickers: list[str] = []
+        self._sub_sids: dict[str, int] = {}  # series → sid from subscribe response
+        self._next_msg_id: int = 1
 
     async def run(self) -> None:
         backoff = RECONNECT_INITIAL
@@ -160,28 +168,77 @@ class Ingester:
             ping_timeout=WS_PING_TIMEOUT,
         ) as ws:
             self._ws = ws
+            self._subscribed_tickers = []
+            self._sub_sids.clear()
+            self._next_msg_id = 1
             try:
-                msg_id = 1
                 for series, tickers in by_series.items():
                     if not tickers:
                         continue
                     await ws.send(json.dumps({
-                        "id": msg_id,
+                        "id": self._next_msg_id,
                         "cmd": "subscribe",
                         "params": {
                             "channels": PUBLIC_CHANNELS,
                             "market_tickers": tickers,
                         },
                     }))
-                    msg_id += 1
+                    self._next_msg_id += 1
+                    self._subscribed_tickers.extend(tickers)
+
+                # Start periodic re-snapshot task
+                snapshot_task = asyncio.create_task(self._periodic_snapshots())
 
                 async for raw in ws:
                     if self._shutdown.is_set():
                         break
                     await self._handle_frame(raw)
+
+                snapshot_task.cancel()
+                try:
+                    await snapshot_task
+                except asyncio.CancelledError:
+                    pass
             finally:
                 self._ws = None
         return True
+
+    async def _periodic_snapshots(self) -> None:
+        """Request fresh orderbook snapshots periodically via WS get_snapshot.
+
+        Corrects cumulative book drift from the fill-decrement approximation.
+        """
+        while not self._shutdown.is_set():
+            try:
+                await asyncio.wait_for(self._shutdown.wait(), timeout=SNAPSHOT_INTERVAL)
+                return  # shutdown
+            except asyncio.TimeoutError:
+                pass
+
+            ws = self._ws
+            if ws is None or not self._subscribed_tickers:
+                continue
+
+            # Collect known sids
+            sids = list(set(self._sub_sids.values()))
+            if not sids:
+                continue
+
+            try:
+                await ws.send(json.dumps({
+                    "id": self._next_msg_id,
+                    "cmd": "update_subscription",
+                    "params": {
+                        "sids": sids,
+                        "market_tickers": self._subscribed_tickers,
+                        "action": "get_snapshot",
+                    },
+                }))
+                self._next_msg_id += 1
+                log.info("requested re-snapshot for %d tickers (%d sids)",
+                         len(self._subscribed_tickers), len(sids))
+            except Exception:
+                log.exception("failed to request re-snapshot")
 
     async def _handle_frame(self, raw: str | bytes) -> None:
         t_receipt = time.time()
@@ -190,6 +247,13 @@ class Ingester:
         except json.JSONDecodeError:
             log.warning("non-json frame: %r", raw[:200] if isinstance(raw, (str, bytes)) else raw)
             return
+
+        # Track subscription IDs from snapshot/delta messages
+        sid = frame.get("sid")
+        msg = frame.get("msg", {})
+        ticker = msg.get("market_ticker")
+        if sid is not None and ticker is not None:
+            self._sub_sids[ticker] = sid
 
         # Bronze: archive raw frame
         channel = frame.get("type") or "unknown"
