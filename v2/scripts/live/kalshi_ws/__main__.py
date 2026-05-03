@@ -57,7 +57,7 @@ WS_PING_TIMEOUT = 10
 # Periodic REST-based re-snapshot to correct book drift.
 # Kalshi's orderbook_delta channel doesn't emit deltas for fills,
 # so our fill-decrement approximation drifts over time.
-SNAPSHOT_INTERVAL = 60  # seconds between re-snapshots
+SNAPSHOT_INTERVAL = 15  # seconds between re-snapshots
 
 log = logging.getLogger("live.kalshi_ws")
 
