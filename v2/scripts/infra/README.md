@@ -4,14 +4,13 @@ AWS infrastructure setup scripts. Idempotent — safe to re-run.
 
 ## setup_glue_catalog.py
 
-Creates the AWS Glue Data Catalog and Athena workgroup for querying silver Parquet data with SQL.
+Creates the AWS Glue Data Catalog and Athena workgroup for querying silver Parquet data.
 
-- Creates `prediction_markets` Glue database
-- Creates 8 tables (one per silver event type) with partition projection on `date` + `v`
-- Creates `prediction-markets` Athena workgroup with 10 GB scan cutoff
-- Re-running updates existing table definitions (useful after schema changes)
+- Database: `prediction_markets`
+- 9 silver tables (incl. `order_book_depth`) + 1 reference table (`market_metadata`)
+- Partition projection: `date` (string) + `v` (integer, currently 3)
+- Workgroup: `prediction-markets` with 10 GB scan cutoff
 
 ```bash
-python -m v2.scripts.infra.setup_glue_catalog --dry-run
 python -m v2.scripts.infra.setup_glue_catalog
 ```

@@ -1,19 +1,16 @@
 # v2/app/transforms
 
-Stateful transforms that convert raw WebSocket frames into typed domain events.
+Stateful transforms that convert raw WebSocket frames into typed events and depth rows.
 
 ## kalshi_ws.py
 
-Maintains an in-memory order book per ticker (`OrderBookState`) and produces typed events from raw Kalshi WS frames:
+`KalshiTransform` — maintains a `BookState` per ticker and produces a `TransformResult` from each raw Kalshi WS frame:
 
-- `orderbook_snapshot` → builds full book state, emits `OrderBookUpdate` (BBO + top-of-book size)
-- `orderbook_delta` → applies incremental update to book, emits `OrderBookUpdate`
+- `orderbook_snapshot` → seeds full book state, emits `OrderBookDepth` row (53 columns)
+- `orderbook_delta` → applies incremental update, emits `OrderBookDepth` row
 - `trade` → emits `TradeEvent` (price, size, taker side)
 - Connection change (new `conn_id`) → emits `BookInvalidated` for every tracked ticker, clears all books
 
-Key design decisions:
-- **Integer cents throughout** — no floats for prices or sizes. Kalshi sends 4-decimal dollar strings (`"0.5200"`), converted via `_dollars_to_cents()` → `52`
-- **Single execution site** — called synchronously in the ingester loop. Same transform runs in live and replay, so parity is structural, not disciplinary
-- **MIN_SIZE filter (50 cents)** — levels below this are floating-point artifacts from accumulated deltas, not real orders
+Returns `TransformResult(events: list[Event], depth_rows: list[dict])`. Events are `TradeEvent` and `BookInvalidated` dataclasses. Depth rows are pre-formatted dicts with nanosecond timestamps, ready for `SilverWriter.emit_row()`.
 
-Copied from v1 — identical logic.
+Uses `BookState` from `v2.app.core.book_state` — no MIN_SIZE filtering, preserves all levels.

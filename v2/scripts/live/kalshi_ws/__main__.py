@@ -204,16 +204,20 @@ class Ingester:
             channel=channel,
         )
 
-        # Transform: raw frame → typed events
+        # Transform: raw frame → typed events + depth rows
         try:
-            events = self._transform(frame, t_receipt, conn_id=self._conn_id)
+            result = self._transform(frame, t_receipt, conn_id=self._conn_id)
         except Exception:
             log.exception("transform error on %s", channel)
             return
 
-        # Silver: write typed events (v=3 format)
-        for event in events:
+        # Silver: write typed events (TradeEvent, BookInvalidated)
+        for event in result.events:
             await self.silver.emit(event)
+
+        # Silver: write depth rows (OrderBookDepth)
+        for row in result.depth_rows:
+            await self.silver.emit_row("OrderBookDepth", row)
 
     def shutdown(self) -> None:
         log.info("shutdown requested")

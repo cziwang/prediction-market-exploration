@@ -75,6 +75,7 @@ class TestSchemas:
             "OrderBookUpdate", "TradeEvent", "BookInvalidated",
             "MMQuoteEvent", "MMOrderEvent", "MMFillEvent",
             "MMReconcileEvent", "MMCircuitBreakerEvent",
+            "OrderBookDepth",
         }
         assert set(SCHEMAS.keys()) == expected
 

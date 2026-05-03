@@ -17,15 +17,20 @@ from typing import Union
 
 @dataclass(frozen=True)
 class OrderBookUpdate:
+    """Deprecated: use OrderBookDepth silver table instead.
+
+    Kept for backwards compatibility with existing v=3 silver data.
+    The live ingester no longer emits this event type.
+    """
     t_receipt: float
     market_ticker: str
     bid_yes: int
     ask_yes: int
     bid_size: int
     ask_size: int
-    t_exchange: float | None = None  # Kalshi server timestamp (None for snapshots)
-    sid: int | None = None           # subscription ID
-    seq: int | None = None           # sequence number (for gap detection)
+    t_exchange: float | None = None
+    sid: int | None = None
+    seq: int | None = None
 
 
 @dataclass(frozen=True)
@@ -116,3 +121,14 @@ Event = Union[
     BookInvalidated, MMQuoteEvent, MMOrderEvent, MMFillEvent,
     MMReconcileEvent, MMCircuitBreakerEvent,
 ]
+
+
+@dataclass
+class TransformResult:
+    """Return type of KalshiTransform.__call__().
+
+    events: typed Event dataclasses (TradeEvent, BookInvalidated, etc.)
+    depth_rows: OrderBookDepth dicts (pre-formatted with ns timestamps)
+    """
+    events: list[Event]
+    depth_rows: list[dict]

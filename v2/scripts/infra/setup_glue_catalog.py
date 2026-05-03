@@ -113,6 +113,41 @@ GLUE_TABLES: dict[str, list[dict]] = {
         {"Name": "consecutive_failures", "Type": "int"},
         {"Name": "last_error", "Type": "string"},
     ],
+    "order_book_depth": (
+        [
+            {"Name": "t_receipt_ns", "Type": "bigint"},
+            {"Name": "t_exchange_ns", "Type": "bigint"},
+            {"Name": "market_ticker", "Type": "string"},
+            {"Name": "seq", "Type": "int"},
+            {"Name": "sid", "Type": "int"},
+        ]
+        + [
+            col
+            for i in range(1, 11)
+            for col in [
+                {"Name": f"bid_{i}", "Type": "int"},
+                {"Name": f"bid_{i}_size", "Type": "int"},
+            ]
+        ]
+        + [
+            col
+            for i in range(1, 11)
+            for col in [
+                {"Name": f"ask_{i}", "Type": "int"},
+                {"Name": f"ask_{i}_size", "Type": "int"},
+            ]
+        ]
+        + [
+            {"Name": "bid_depth_5c", "Type": "int"},
+            {"Name": "ask_depth_5c", "Type": "int"},
+            {"Name": "bid_depth_10c", "Type": "int"},
+            {"Name": "ask_depth_10c", "Type": "int"},
+            {"Name": "num_bid_levels", "Type": "int"},
+            {"Name": "num_ask_levels", "Type": "int"},
+            {"Name": "spread", "Type": "int"},
+            {"Name": "mid_x2", "Type": "int"},
+        ]
+    ),
 }
 
 # Map snake_case table name -> PascalCase S3 directory name
@@ -125,6 +160,7 @@ _TABLE_TO_S3_DIR: dict[str, str] = {
     "mm_fill_event": "MMFillEvent",
     "mm_reconcile_event": "MMReconcileEvent",
     "mm_circuit_breaker_event": "MMCircuitBreakerEvent",
+    "order_book_depth": "OrderBookDepth",
 }
 
 _TABLE_DESCRIPTIONS: dict[str, str] = {
@@ -136,7 +172,58 @@ _TABLE_DESCRIPTIONS: dict[str, str] = {
     "mm_fill_event": "Market maker fill notifications with position tracking",
     "mm_reconcile_event": "Internal vs exchange state mismatches detected during reconciliation",
     "mm_circuit_breaker_event": "Circuit breaker state transitions triggered by consecutive failures",
+    "order_book_depth": "Top-10 depth levels and aggregate metrics per book delta, rebuilt from bronze replay",
 }
+
+
+REFERENCE_PREFIX = f"s3://{S3_BUCKET}/reference"
+
+# Non-partitioned reference tables (single Parquet file, no date/v partitions)
+GLUE_REFERENCE_TABLES: dict[str, list[dict]] = {
+    "market_metadata": [
+        {"Name": "ticker", "Type": "string"},
+        {"Name": "series_ticker", "Type": "string"},
+        {"Name": "event_ticker", "Type": "string"},
+        {"Name": "title", "Type": "string"},
+        {"Name": "yes_sub_title", "Type": "string"},
+        {"Name": "no_sub_title", "Type": "string"},
+        {"Name": "status", "Type": "string"},
+        {"Name": "result", "Type": "string"},
+        {"Name": "open_time", "Type": "timestamp"},
+        {"Name": "close_time", "Type": "timestamp"},
+        {"Name": "expiration_time", "Type": "timestamp"},
+        {"Name": "settlement_time", "Type": "timestamp"},
+        {"Name": "volume", "Type": "bigint"},
+        {"Name": "volume_24h", "Type": "bigint"},
+        {"Name": "last_price_cents", "Type": "int"},
+        {"Name": "settlement_value_cents", "Type": "int"},
+    ],
+}
+
+_REFERENCE_DESCRIPTIONS: dict[str, str] = {
+    "market_metadata": "Kalshi market metadata and settlement outcomes fetched via REST API",
+}
+
+
+def _reference_table_input(table_name: str, columns: list[dict]) -> dict:
+    """Build Glue table input for a non-partitioned reference table."""
+    return {
+        "Name": table_name,
+        "Description": _REFERENCE_DESCRIPTIONS.get(table_name, ""),
+        "StorageDescriptor": {
+            "Columns": columns,
+            "Location": f"{REFERENCE_PREFIX}/",
+            "InputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
+            "OutputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
+            "SerdeInfo": {
+                "SerializationLibrary": "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
+                "Parameters": {"serialization.format": "1"},
+            },
+            "Compressed": True,
+        },
+        "TableType": "EXTERNAL_TABLE",
+        "Parameters": {"classification": "parquet"},
+    }
 
 
 def _table_input(table_name: str, columns: list[dict]) -> dict:
@@ -269,10 +356,27 @@ def main() -> None:
     for table_name, columns in GLUE_TABLES.items():
         create_or_update_table(glue, table_name, columns, dry_run=args.dry_run)
 
+    for table_name, columns in GLUE_REFERENCE_TABLES.items():
+        table_input = _reference_table_input(table_name, columns)
+        if args.dry_run:
+            log.info("[DRY RUN] would create/update reference table %s.%s (%d columns)",
+                     DATABASE, table_name, len(columns))
+        else:
+            try:
+                glue.create_table(DatabaseName=DATABASE, TableInput=table_input)
+                log.info("created reference table %s.%s", DATABASE, table_name)
+            except ClientError as e:
+                if e.response["Error"]["Code"] == "AlreadyExistsException":
+                    glue.update_table(DatabaseName=DATABASE, TableInput=table_input)
+                    log.info("updated reference table %s.%s", DATABASE, table_name)
+                else:
+                    raise
+
     create_athena_workgroup(athena, dry_run=args.dry_run)
 
+    total = len(GLUE_TABLES) + len(GLUE_REFERENCE_TABLES)
     log.info("done — %d tables in %s, workgroup %s",
-             len(GLUE_TABLES), DATABASE, ATHENA_WORKGROUP)
+             total, DATABASE, ATHENA_WORKGROUP)
 
 
 if __name__ == "__main__":

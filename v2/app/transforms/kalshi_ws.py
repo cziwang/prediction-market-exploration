@@ -1,7 +1,8 @@
-"""Kalshi WS frame → typed events.
+"""Kalshi WS frame → typed events + depth rows.
 
-Copied from v1 — identical transform logic. Stateful: maintains per-ticker
-order book state and emits OrderBookUpdate / TradeEvent / BookInvalidated.
+Stateful: maintains per-ticker BookState and produces:
+- TradeEvent, BookInvalidated (as Event dataclasses)
+- OrderBookDepth rows (as pre-formatted dicts)
 
 Integer cents throughout — no floats for prices or sizes.
 """
@@ -9,121 +10,20 @@ Integer cents throughout — no floats for prices or sizes.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
 from typing import Optional
 
-from v2.app.events import BookInvalidated, Event, OrderBookUpdate, TradeEvent
+from v2.app.core.book_state import BookState, extract_depth_row
+from v2.app.core.conversions import dollars_to_cents, parse_ts
+from v2.app.events import BookInvalidated, Event, TradeEvent, TransformResult
 
 log = logging.getLogger(__name__)
 
-MIN_SIZE = 50  # 0.5 dollars — well below any real order
-
-
-class OrderBookState:
-    """In-memory order book for one ticker. Dict[int, int] = price_cents → size_cents."""
-
-    __slots__ = ("yes_book", "no_book", "_min_size")
-
-    def __init__(self) -> None:
-        self.yes_book: dict[int, int] = {}
-        self.no_book: dict[int, int] = {}
-        self._min_size: int = MIN_SIZE
-
-    @classmethod
-    def from_snapshot(cls, msg: dict, min_size: int = MIN_SIZE) -> "OrderBookState":
-        book = cls()
-        book._min_size = min_size
-        for price_str, size_str in msg.get("yes_dollars_fp", []):
-            p = _dollars_to_cents(price_str)
-            s = int(round(float(size_str)))
-            if s >= min_size:
-                book.yes_book[p] = s
-        for price_str, size_str in msg.get("no_dollars_fp", []):
-            p = _dollars_to_cents(price_str)
-            s = int(round(float(size_str)))
-            if s >= min_size:
-                book.no_book[p] = s
-        return book
-
-    def apply_delta(self, msg: dict) -> None:
-        price_cents = _dollars_to_cents(msg["price_dollars"])
-        delta_cents = int(round(float(msg["delta_fp"])))
-        side = msg["side"]
-        book = self.yes_book if side == "yes" else self.no_book
-        min_size = self._min_size
-        new_size = book.get(price_cents, 0) + delta_cents
-        if new_size < min_size:
-            book.pop(price_cents, None)
-        else:
-            book[price_cents] = new_size
-
-    @property
-    def best_bid(self) -> int | None:
-        return max(self.yes_book) if self.yes_book else None
-
-    @property
-    def best_ask(self) -> int | None:
-        if not self.no_book:
-            return None
-        return 100 - max(self.no_book)
-
-    @property
-    def bid_size_top(self) -> int:
-        if not self.yes_book:
-            return 0
-        return self.yes_book[max(self.yes_book)]
-
-    @property
-    def ask_size_top(self) -> int:
-        if not self.no_book:
-            return 0
-        return self.no_book[max(self.no_book)]
-
-    @property
-    def mid(self) -> int | None:
-        b, a = self.best_bid, self.best_ask
-        if b is None or a is None:
-            return None
-        return (b + a) // 2
-
-
-def _dollars_to_cents(s: str) -> int:
-    """'0.5200' → 52. Handles Kalshi's 4-decimal dollar strings."""
-    return int(round(float(s) * 100))
-
-
-def _parse_ts(ts) -> float | None:
-    """Parse Kalshi's server timestamp to float seconds.
-
-    Handles: epoch int/float (seconds or ms), epoch string, ISO string, None.
-    """
-    if ts is None:
-        return None
-    if isinstance(ts, (int, float)):
-        # If > 1e12, it's milliseconds; convert to seconds
-        return ts / 1000.0 if ts > 1e12 else float(ts)
-    if isinstance(ts, str):
-        if not ts:
-            return None
-        try:
-            val = float(ts)
-            return val / 1000.0 if val > 1e12 else val
-        except ValueError:
-            pass
-        # ISO 8601: "2026-04-26T00:29:22.803263Z"
-        try:
-            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            return dt.timestamp()
-        except (ValueError, AttributeError):
-            pass
-    return None
-
 
 class KalshiTransform:
-    """Raw WS frame → list of typed Events."""
+    """Raw WS frame → TransformResult (events + depth rows)."""
 
     def __init__(self) -> None:
-        self._books: dict[str, OrderBookState] = {}
+        self._books: dict[str, BookState] = {}
         self._conn_id: str | None = None
 
     def __call__(
@@ -131,8 +31,9 @@ class KalshiTransform:
         frame: dict,
         t_receipt: float,
         conn_id: Optional[str] = None,
-    ) -> list[Event]:
+    ) -> TransformResult:
         events: list[Event] = []
+        depth_rows: list[dict] = []
 
         if conn_id is not None and conn_id != self._conn_id:
             for ticker in list(self._books):
@@ -148,64 +49,55 @@ class KalshiTransform:
             msg = frame.get("msg", {})
             ticker = msg.get("market_ticker")
             if not ticker:
-                return events
-            self._books[ticker] = OrderBookState.from_snapshot(msg)
-            book = self._books[ticker]
-            if book.best_bid is not None and book.best_ask is not None:
-                events.append(OrderBookUpdate(
-                    t_receipt=t_receipt,
-                    market_ticker=ticker,
-                    bid_yes=book.best_bid,
-                    ask_yes=book.best_ask,
-                    bid_size=book.bid_size_top,
-                    ask_size=book.ask_size_top,
-                    t_exchange=None,  # snapshots don't have ts
-                    sid=sid,
-                    seq=seq,
-                ))
+                return TransformResult(events, depth_rows)
+            book = BookState.from_snapshot(msg)
+            book.seq = seq
+            book.sid = sid
+            self._books[ticker] = book
+            t_receipt_ns = int(t_receipt * 1_000_000_000)
+            depth_rows.append(extract_depth_row(
+                book, t_receipt_ns, None, ticker, seq, sid,
+            ))
 
         elif msg_type == "orderbook_delta":
             msg = frame.get("msg", {})
             ticker = msg.get("market_ticker")
             if not ticker:
-                return events
+                return TransformResult(events, depth_rows)
             book = self._books.get(ticker)
             if book is None:
-                return events
-            book.apply_delta(msg)
-            t_exchange = _parse_ts(msg.get("ts"))
-            if book.best_bid is not None and book.best_ask is not None:
-                events.append(OrderBookUpdate(
-                    t_receipt=t_receipt,
-                    market_ticker=ticker,
-                    bid_yes=book.best_bid,
-                    ask_yes=book.best_ask,
-                    bid_size=book.bid_size_top,
-                    ask_size=book.ask_size_top,
-                    t_exchange=t_exchange,
-                    sid=sid,
-                    seq=seq,
-                ))
+                return TransformResult(events, depth_rows)
+            price_cents = dollars_to_cents(msg["price_dollars"])
+            delta = int(round(float(msg["delta_fp"])))
+            side = msg["side"]
+            book.apply_delta(price_cents, delta, side)
+            book.seq = seq
+            t_exchange = parse_ts(msg.get("ts"))
+            t_receipt_ns = int(t_receipt * 1_000_000_000)
+            t_exchange_ns = int(t_exchange * 1_000_000_000) if t_exchange else None
+            depth_rows.append(extract_depth_row(
+                book, t_receipt_ns, t_exchange_ns, ticker, seq, sid,
+            ))
 
         elif msg_type == "trade":
             msg = frame.get("msg", {})
             ticker = msg.get("market_ticker")
             if not ticker:
-                return events
+                return TransformResult(events, depth_rows)
             yes_price = msg.get("yes_price_dollars")
             count_fp = msg.get("count_fp")
             taker_side = msg.get("taker_side")
-            t_exchange = _parse_ts(msg.get("ts"))
+            t_exchange = parse_ts(msg.get("ts"))
             if yes_price is not None and count_fp is not None and taker_side:
                 events.append(TradeEvent(
                     t_receipt=t_receipt,
                     market_ticker=ticker,
                     side=taker_side,
-                    price=_dollars_to_cents(str(yes_price)),
+                    price=dollars_to_cents(str(yes_price)),
                     size=int(round(float(count_fp))),
                     t_exchange=t_exchange,
                     sid=sid,
                     seq=seq,
                 ))
 
-        return events
+        return TransformResult(events, depth_rows)

@@ -121,6 +121,41 @@ SCHEMAS: dict[str, pa.Schema] = {
         ("consecutive_failures", pa.int32()),
         ("last_error", pa.utf8()),     # nullable
     ]),
+    "OrderBookDepth": pa.schema(
+        [
+            ("t_receipt_ns", pa.int64()),
+            ("t_exchange_ns", pa.int64()),
+            ("market_ticker", _dict_utf8),
+            ("seq", pa.int32()),
+            ("sid", pa.int32()),
+        ]
+        + [
+            col
+            for i in range(1, 11)
+            for col in [
+                (f"bid_{i}", pa.int32()),
+                (f"bid_{i}_size", pa.int32()),
+            ]
+        ]
+        + [
+            col
+            for i in range(1, 11)
+            for col in [
+                (f"ask_{i}", pa.int32()),
+                (f"ask_{i}_size", pa.int32()),
+            ]
+        ]
+        + [
+            ("bid_depth_5c", pa.int32()),
+            ("ask_depth_5c", pa.int32()),
+            ("bid_depth_10c", pa.int32()),
+            ("ask_depth_10c", pa.int32()),
+            ("num_bid_levels", pa.int32()),
+            ("num_ask_levels", pa.int32()),
+            ("spread", pa.int32()),
+            ("mid_x2", pa.int32()),
+        ]
+    ),
 }
 
 
@@ -157,6 +192,7 @@ class SilverWriter:
         self._s3 = s3_client or boto3.client("s3")
 
         self._buffers: dict[str, list[Event]] = defaultdict(list)
+        self._raw_buffers: dict[str, list[dict]] = defaultdict(list)
         self._flush_task: asyncio.Task | None = None
         self._draining = False
 
@@ -176,6 +212,10 @@ class SilverWriter:
     async def emit(self, event: Event) -> None:
         self._buffers[type(event).__name__].append(event)
 
+    async def emit_row(self, type_name: str, row: dict) -> None:
+        """Emit a pre-formatted row dict (timestamps already in nanoseconds)."""
+        self._raw_buffers[type_name].append(row)
+
     async def _flush_loop(self) -> None:
         while True:
             await asyncio.sleep(self._flush_seconds)
@@ -185,21 +225,29 @@ class SilverWriter:
                 log.exception("silver flush_loop error")
 
     async def _flush_all(self) -> None:
-        for type_name in list(self._buffers.keys()):
+        all_types = set(self._buffers.keys()) | set(self._raw_buffers.keys())
+        for type_name in list(all_types):
             await self._flush_type(type_name)
 
     async def _flush_type(self, type_name: str) -> str | None:
-        events = self._buffers[type_name]
-        if not events:
+        events = self._buffers.get(type_name, [])
+        raw_rows = self._raw_buffers.get(type_name, [])
+        total = len(events) + len(raw_rows)
+        if total == 0:
             return None
 
         # Min-rows guard: skip flush unless draining (shutdown)
-        if len(events) < self._min_rows and not self._draining:
+        if total < self._min_rows and not self._draining:
             return None
 
         self._buffers[type_name] = []
+        self._raw_buffers[type_name] = []
 
-        rows = _prepare_rows(events)
+        # Event dataclasses need asdict + timestamp conversion.
+        # Raw dicts are already in the correct format.
+        rows = _prepare_rows(events) if events else []
+        rows.extend(raw_rows)
+        rows.sort(key=lambda r: r["t_receipt_ns"])
         schema = SCHEMAS.get(type_name)
         if schema is not None:
             table = pa.Table.from_pylist(rows, schema=schema)
