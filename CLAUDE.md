@@ -1,11 +1,14 @@
 # prediction-market-exploration
 
-Kalshi prediction market data collection, backtesting, and live market making.
+Kalshi prediction market data + trading.
 
 ## Repo layout
 
-- `v1/` — Live MM strategy + batch fetchers (deployed on EC2, being deprecated)
-- `v2/` — Data infrastructure rebuild: optimized storage, query catalog, replay engine
+- `nba-mm/` — Market-making infrastructure (Kalshi WS feed, data pipeline, MM strategy)
+  - `nba-mm/v1/` — Live MM strategy + batch fetchers (deployed on EC2, being deprecated)
+  - `nba-mm/v2/` — Data infrastructure rebuild: optimized storage, query catalog, replay engine
+- `nba-edge/` — NBA model + edge trading (build predictive model, trade when we have edge)
+- `market-maker/` — Full LOB reconstruction + market-making (standalone, AWS stack)
 
 ## Environment
 
@@ -16,15 +19,16 @@ Kalshi prediction market data collection, backtesting, and live market making.
 
 ## Key rules
 
-- **v1/ and v2/ are fully independent.** Never import, reference, or share code between them unless explicitly asked. Treat them as separate repos. v1 is being deprecated and will eventually be deleted.
+- **nba-mm/, nba-edge/, and market-maker/ are all independent.** Don't share code between them unless explicitly asked.
+- **nba-mm/v1/ and nba-mm/v2/ are independent.** v1 is being deprecated.
 - Integer cents for all prices and sizes — no floats for money
 - Bronze (gzip-JSONL) is the authoritative archive. Silver is rebuildable from bronze.
-- Active development is in `v2/`. See `v2/CLAUDE.md` for current context.
+- Active MM development is in `nba-mm/v2/`. See `nba-mm/v2/CLAUDE.md` for context.
 
 ## Commands
 
 ```bash
 source .venv/bin/activate
-python -m pytest v2/tests/ -v       # v2 tests (10)
-python -m pytest v1/tests/ -v       # v1 tests (66)
+python -m pytest nba-mm/v2/tests/ -v       # v2 tests
+python -m pytest nba-mm/v1/tests/ -v       # v1 tests
 ```
