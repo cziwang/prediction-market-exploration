@@ -5,6 +5,11 @@ Stateful: maintains per-ticker BookState and produces:
 - OrderBookDepth rows (as pre-formatted dicts)
 
 Integer cents throughout — no floats for prices or sizes.
+
+Note: Kalshi's orderbook_delta channel DOES emit negative deltas for
+matched fills.  Trades therefore do NOT modify BookState — the
+corresponding delta message handles the book update.  Verified
+empirically in v2/notebooks/delta_fill_test.ipynb (2026-05-03).
 """
 
 from __future__ import annotations
@@ -67,11 +72,26 @@ class KalshiTransform:
             book = self._books.get(ticker)
             if book is None:
                 return TransformResult(events, depth_rows)
+            # Skip deltas from a stale subscription — after a re-snapshot
+            # creates a new sid, old-sid deltas still arrive and would
+            # corrupt the book if applied.
+            if sid is not None and book.sid is not None and sid != book.sid:
+                return TransformResult(events, depth_rows)
             price_cents = dollars_to_cents(msg["price_dollars"])
             delta = int(round(float(msg["delta_fp"])))
             side = msg["side"]
             book.apply_delta(price_cents, delta, side)
             book.seq = seq
+
+            # If the book has crossed (drift from missed messages or stale
+            # seeded state), invalidate it rather than emitting bad data.
+            # A future snapshot will re-establish correct state.
+            spread = book.spread
+            if spread is not None and spread < 0:
+                del self._books[ticker]
+                events.append(BookInvalidated(t_receipt=t_receipt, market_ticker=ticker))
+                return TransformResult(events, depth_rows)
+
             t_exchange = parse_ts(msg.get("ts"))
             t_receipt_ns = int(t_receipt * 1_000_000_000)
             t_exchange_ns = int(t_exchange * 1_000_000_000) if t_exchange else None
@@ -101,25 +121,8 @@ class KalshiTransform:
                     sid=sid,
                     seq=seq,
                 ))
-
-                # Apply fill to book state — Kalshi's orderbook_delta
-                # channel does not emit deltas for matched fills, so we
-                # must decrement the consumed side ourselves.
-                book = self._books.get(ticker)
-                if book is not None:
-                    if taker_side == "yes":
-                        # YES taker consumed a resting NO order at
-                        # NO price = (100 - yes_price) cents.
-                        book.apply_delta(100 - yes_price_cents, -fill_size, "no")
-                    else:
-                        # NO taker consumed a resting YES order at
-                        # YES price = yes_price cents.
-                        book.apply_delta(yes_price_cents, -fill_size, "yes")
-                    book.seq = seq
-                    t_receipt_ns = int(t_receipt * 1_000_000_000)
-                    t_exchange_ns = int(t_exchange * 1_000_000_000) if t_exchange else None
-                    depth_rows.append(extract_depth_row(
-                        book, t_receipt_ns, t_exchange_ns, ticker, seq, sid,
-                    ))
+                # No book update here — the orderbook_delta channel
+                # emits a negative delta for the filled quantity, so
+                # the delta handler will update the book.
 
         return TransformResult(events, depth_rows)
