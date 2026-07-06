@@ -1,7 +1,0 @@
-boto3
-polars
-pyarrow
-numpy
-scipy
-matplotlib
-scikit-learn

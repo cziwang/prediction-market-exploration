@@ -1,7 +1,0 @@
-websockets
-httpx
-cryptography
-boto3
-pyarrow
-polars
-python-dotenv
