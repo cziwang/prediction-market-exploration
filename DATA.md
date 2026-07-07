@@ -25,7 +25,12 @@ s3://prediction-markets-data/
 │   │   ├── orderbook_delta/YYYY/MM/DD/HH/{uuid}.jsonl.gz
 │   │   └── trade/YYYY/MM/DD/HH/{uuid}.jsonl.gz
 │   └── nba_cdn/
-│       └── boxscore/YYYY/MM/DD/HH/*.jsonl.gz   # NBA live boxscores
+│       ├── live_pbp/YYYY/MM/DD/HH/{uuid}.jsonl.gz   # Raw CDN poll fragments (one action per line)
+│       ├── boxscore/YYYY/MM/DD/HH/*.jsonl.gz         # NBA live boxscores
+│       ├── scoreboard/YYYY/MM/DD/HH/*.jsonl.gz       # Scoreboard snapshots
+│       ├── odds/YYYY/MM/DD/HH/*.jsonl.gz             # Odds data
+│       ├── scoreboard/YYYY/MM/DD/HH/*.jsonl.gz       # Scoreboard snapshots
+│       └── odds/YYYY/MM/DD/HH/*.jsonl.gz             # Odds data
 ├── silver/
 │   └── kalshi_ws/                        # Typed Parquet events (v=3)
 │       ├── OrderBookDepth/date=YYYY-MM-DD/v=3/part-*.parquet
@@ -46,6 +51,8 @@ s3://prediction-markets-data/
 │   └── silver/
 │       ├── lob/dt=YYYY-MM-DD/lob.parquet
 │       └── trades/dt=YYYY-MM-DD/trades.parquet
+├── bronze_merged/                        # Merged + deduped per game (59 playoff games, Apr–May 2026)
+│   └── nba_pbp_{game_id}.jsonl.gz        # One file per game, sorted by action_number
 ├── kalshi/                               # Historical batch-fetched data
 │   ├── historical_markets/
 │   ├── historical_trades/

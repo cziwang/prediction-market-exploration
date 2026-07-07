@@ -1,0 +1,17 @@
+.venv/
+venv*/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+data/
+*.duckdb
+.env
+keys/
+.ipynb_checkpoints/
+dist/
+build/
+*.egg-info/
+.hypothesis/
+.claude/settings.local.json
