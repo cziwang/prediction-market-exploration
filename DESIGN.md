@@ -148,14 +148,15 @@ If 30% of trades have stale game state and the average delay is 15 seconds, you 
 
 ### How this shapes the Flink join
 
-The enrichment operator maintains **two** game-state value states per key:
+The enrichment operator maintains **two** game-state views per key, updated as buffered records are finalized in timestamp order:
 
 ```
-latest_game_state_by_receipt    ← updated when we RECEIVE a game state (t_receipt ordering)
-latest_game_state_by_event      ← updated when a game event's timeActual is the newest seen
+receipt view    ← latest game state by t_receipt_ns (what our system knew)
+event view      ← game state with max t_event_ns among those processed
+                  (what had actually happened on court, per best knowledge)
 ```
 
-On each trade, the operator emits one row carrying **both** views. The watermark and buffering logic operates on `t_receipt` (since receipt time is the clock our system actually runs on). The `timeActual`/`ts_ms` fields are carried as payload and used to populate the event-time columns.
+On each trade, the operator emits one row carrying **both** views. The watermark and buffering logic operates on `t_receipt` (since receipt time is the clock our system actually runs on). The `timeActual`/`ts_ms` fields are carried as payload and used to populate the event-time columns. Full buffering semantics in D1.
 
 ---
 
@@ -169,19 +170,21 @@ An interval join is wrong for this problem twice over:
 
 **Problem 2 — silent drops:** It is an inner join. A trade with no game state in the window (pregame, halftime, CDN outage) produces zero output. That trade disappears from the dataset. You never notice it's gone. Silent row loss in the canonical tick store is unacceptable.
 
-**Solution:** A `KeyedCoProcessFunction` keyed by `game_id`:
+**Solution:** A `KeyedCoProcessFunction` keyed by `game_id`, buffering **both** streams:
 
-- **Game state side:** keep the latest `GameStateEvent` in keyed `ValueState` — one state per timestamp view (receipt-time and event-time)
-- **Trade side:** buffer trades in keyed `MapState[timestamp, list[Trade]]`, register an event-time timer at each trade's `t_receipt_ns`
-- **On timer fire** (watermark has passed the trade's receipt timestamp, meaning all game states with earlier receipt times have arrived): enrich the trade against the latest game state per view, emit
+- **Both sides buffered:** game states *and* trades are held in keyed state until the watermark passes their `t_receipt_ns`; an event-time timer is registered per buffered timestamp
+- **On timer fire:** process all buffered records with `t_receipt_ns ≤ watermark` **in timestamp order** — game states update the two view states (receipt view: latest by `t_receipt_ns`; event view: max `t_event_ns` seen), trades snapshot the views at that instant and emit
+- **Tie at the same timestamp:** the game state applies before the trade ("state as of t" includes updates at t)
 - **No game state available:** emit anyway with null game-state fields. Downstream filters on staleness; the pipeline never drops
-- **Staleness fields:** every enriched record carries `receipt_info_delay_ms` and `event_info_delay_ms` so consumers can filter stale joins
+- **Staleness fields:** every enriched record carries `r_info_delay_ms` and `e_info_delay_ms` so consumers can filter stale joins
 
-**Why buffer trades instead of enriching immediately?**
+**Why buffer *both* streams, not just trades?**
 
-Events arrive out of order over the network. If a trade arrives at processing time T but a game state with an earlier `t_receipt` arrives at T+1 (network jitter), enriching immediately would use the wrong game state. Buffering until the watermark passes guarantees all game states that *could* affect the join have arrived.
+Buffering trades handles network reordering: a trade at T must wait until the watermark confirms all earlier game states have arrived. But a "keep only the latest game state" design has a subtler future-leak: if states S₁(t=1) and S₅(t=5) both arrive *before* the watermark passes a buffered trade T₃(t=3), "latest" is S₅ — enriching T₃ with S₅ uses information from *after* the trade. Processing buffered records in timestamp order enriches T₃ with S₁, exactly what a live system knew at t=3. (Caught by `test_no_future_leak` during implementation of `pm.enrich.join`.)
 
-This is what makes the join **deterministic**: output depends on timestamps and watermarks, not on network arrival order. Batch replay and live streaming produce identical results for identical input.
+This is what makes the join **deterministic**: output depends on timestamps and watermark positions, never on arrival order. Batch replay and live streaming produce identical results for identical input — verified by a Hypothesis property test over arbitrary arrival permutations.
+
+**Implementation note:** the join logic lives in `pm/enrich/join.py` as a pure-Python `AsOfJoiner` class with zero Flink imports (`on_game_state` / `on_trade` / `advance_watermark`). The Flink operator is a thin shell that persists this state and wires `advance_watermark` to event-time timers. The hard semantics are unit-tested in milliseconds; Flink contributes distribution, state persistence, and timer plumbing.
 
 ### D2. One pipeline: replay through Kafka is the only path
 

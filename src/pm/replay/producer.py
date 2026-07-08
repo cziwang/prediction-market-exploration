@@ -75,7 +75,17 @@ class KafkaProducer:
         admin = AdminClient({"bootstrap.servers": bootstrap_servers})
         existing = set(admin.list_topics(timeout=10).topics)
         to_create = [
-            NewTopic(topic, num_partitions=partitions, replication_factor=1)
+            NewTopic(
+                topic,
+                num_partitions=partitions,
+                replication_factor=1,
+                # Infinite retention: replayed records carry their ORIGINAL
+                # timestamps (months old). Kafka's time-based retention uses
+                # message timestamps, so default 7-day retention would delete
+                # a historical replay within minutes of segment roll. Topics
+                # are rebuildable via replay, so unbounded retention is safe.
+                config={"retention.ms": "-1"},
+            )
             for topic, partitions in self._topic_partitions.items()
             if topic not in existing
         ]

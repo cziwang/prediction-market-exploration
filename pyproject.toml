@@ -2,7 +2,7 @@
 name = "pm"
 version = "0.1.0"
 description = "NBA prediction market trading infrastructure (Kappa pipeline: replay, normalize, enrich)"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.7",
     "confluent-kafka>=2.4",
