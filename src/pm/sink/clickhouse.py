@@ -164,8 +164,9 @@ class ClickHouseSink:
             if msg.error():
                 raise RuntimeError(msg.error())
 
-            p, offset = msg.partition(), msg.offset()
-            record = json.loads(msg.value())
+            p, offset, value = msg.partition(), msg.offset(), msg.value()
+            assert p is not None and offset is not None and value is not None
+            record = json.loads(value)
             if p not in self._batches:
                 self._batches[p] = (offset, [])
             first, rows = self._batches[p]
