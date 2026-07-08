@@ -39,3 +39,9 @@ aws s3 cp s3://prediction-markets-data/bronze_merged/kalshi_ws/trade/date=2026-0
 
 Do **not** regenerate casually — these inputs are frozen. If bronze upstream changes,
 the golden output file (added with the Flink job) must be re-verified by hand.
+
+**History:** regenerated 2026-07-07 after fixing a lexicographic-vs-chronological
+ordering bug in `scripts/merge_kalshi_ws.py` (S3 lists UUID-named files
+alphabetically within each hour prefix; the original merge concatenated in that
+order, shuffling ~60s flush chunks). Record count unchanged (20,376); order fixed.
+The bug was caught by the replayer's ordering verification (`pm.replay.merge`).
