@@ -392,6 +392,20 @@ poll `list_topics()` until the names are actually gone before proceeding
 (step 2 of the Layer 3 procedure). Lesson: *distributed deletes are not
 synchronous; "the command returned" ≠ "it happened."*
 
+### War story #6: action order is not receipt order
+The full-dataset replay aborted with `OrderingError` on game `0042500115`:
+a 94-minute backward jump in receipt time. Cause: the PBP consolidation
+script sorted by `action_number` (the NBA's play counter) — but the CDN
+sometimes re-delivers an *edit* to an early action long after it happened,
+so a low action_number can arrive an hour later. Sorting by action number
+put that late arrival back among the early records. Fix: sort merged PBP by
+`(t_receipt, action_number)` — receipt order is the contract, action number
+only breaks ties within a poll. The golden game passed earlier only because
+it happened to contain no late edits. Lesson: *there are usually more
+orderings in a dataset than you think (event order, delivery order, edit
+order) — be explicit about which one you're sorting by and which one your
+consumers require.*
+
 ### War story #5: zstd
 The Flink job crashed with `NoClassDefFoundError: ...ZstdOutputStream...`.
 The replayer compressed Kafka batches with zstd; Flink's shaded Kafka
@@ -414,6 +428,46 @@ compatibility is a producer-side decision.*
 | `SourceError` reading a bronze file | Genuinely malformed/misordered bronze | Investigate the file at the reported line — do not "fix" by skipping |
 
 ---
+
+## Layer 6 — Full backfill verification (Phase 2, in progress)
+
+The full backfill runs all 60 playoff games (2026-04-18 → 2026-05-11)
+through the same pipeline. Sequence (see DESIGN.md Build Order for status):
+
+```bash
+# game map (event_code -> game_id for all 60 games; validated against the
+# golden anchor — the build FAILS if 26APR18ATLNYK doesn't map to 0042500121)
+python scripts/build_game_map.py
+
+# wipe topics + wait (Layer 3 procedure), then:
+python -m pm.replay --source s3 --start 2026-04-18 --end 2026-05-11
+python -m pm.enrich.job --game-map-file reference/game_map.json   # ~2.8M records, slow
+python -m pm.sink.clickhouse --once --group-id ch-sink-backfill
+```
+
+Monitoring a long enrichment run: watch `enriched.trades` grow
+(`get_watermark_offsets` high-low per partition), confirm `dlq.enrich`
+stays 0, and tail the Flink log
+(`.venv/lib/python3.11/site-packages/pyflink/log/flink-*-python-*.log`).
+Periodic "Node disconnected" INFO lines are idle-connection reaping — benign.
+
+Post-backfill verification is automated: `python scripts/verify_backfill.py`.
+Result (2026-07-08): **all checks pass** — 5,851,077 rows, 0 DLQ, 0 duplicates,
+settlement reality check green across all 42 games with post-buzzer trades
+(winner's model prob exactly 1.0, loser's 0.0, winners derived independently
+from the game map). Full-dataset info delay: avg 53s / p50 15s / p95 195s.
+
+**Known data gaps (collection-time, not pipeline bugs):** 50 of 60 games have
+trades. Missing: 9 games during a Kalshi-collector outage (2026-04-28 →
+05-01 — raw bronze has zero trade files those days) and CLE-DET game 1
+(0042500201) whose markets the collector never subscribed to (games 2–3 of
+the same series are present). All 60 games have full PBP.
+
+**Performance finding:** the enrichment run took ~6 hours (~270 rec/s). Root
+cause: the operator re-pickles the entire AsOfJoiner — including every
+buffered trade — into ValueState on every element (O(n²) serialization).
+Fix planned: granular ListState buffer + docker Flink cluster at parallelism
+4; the golden parity test proves the optimization preserves semantics.
 
 ## Where to go next
 

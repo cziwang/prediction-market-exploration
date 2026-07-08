@@ -647,39 +647,76 @@ Instrumented via `perf_counter_ns()` + HDR histogram from Phase 3 onward.
 
 ---
 
-## Build Order
+## Build Order & Status
+
+Status as of **2026-07-08**:
 
 ```
-Phase 0 — Foundations
-  0.1  Design doc complete
-  0.2  Verify Kalshi client_order_id support — DONE (rejected-duplicate semantics)
-  0.3  Golden game fixture: freeze 0042500121 bronze, hand-verify anchor facts
+Phase 0 — Foundations                                              ✅ DONE
+  0.1  Design doc complete                                          ✅
+  0.2  Kalshi client_order_id support — rejected-duplicate          ✅
+  0.3  Golden game fixture (0042500121, hand-verified vs ESPN)      ✅
 
-Phase 1 — Data pipeline
-  1.1  Normalisation layer + DLQ paths (unit-tested, Hypothesis)
-  1.2  Replayer: merge-sort, keyed partitioning, ordering verification
-  1.3  Flink job: dual-view as-of join, asymmetric watermarks,
-       idleness handling — golden game test passing
-  1.4  ClickHouse schema + batched idempotent sink — chaos-kill test passing
+Phase 1 — Data pipeline                                            ✅ DONE
+  1.1  Normalisation layer + DLQ paths (68 unit tests, Hypothesis)  ✅
+  1.2  Replayer: merge-sort, keyed partitioning, ordering checks    ✅
+  1.3  Flink job: dual-view as-of join — golden PARITY test passes  ✅
+       (wipe → replay → job reproduces frozen output byte-for-byte)
+       DLQ topic wired; injected-garbage test passes                ✅
+  1.4  ClickHouse: MergeTree schema + offset-aligned idempotent
+       sink — full-reprocess chaos test inserts zero duplicates     ✅
 
-Phase 2 — Research infrastructure
-  2.1  Full 59-game backfill; validate vs settlement results
-  2.2  Information delay analysis (receipt vs event view comparison)
-  2.3  Ray backtest engine + immutable results store
-  2.4  First strategy backtest (analytical model, KXNBAGAME)
+Phase 2 — Research infrastructure                                  🔶 IN PROGRESS
+  2.1  Full backfill                                                ✅ DONE
+       - event_code → game_id map: 60 games, golden-anchored        ✅
+       - trade merges extended to 2026-05-11 (+2.19M records)       ✅
+       - PBP merge re-sorted by t_receipt (war story #6) + synced   ✅
+       - replay → enrich → ClickHouse: 5,851,077 enriched trades,
+         50 games, 0 DLQ, 0 duplicates                              ✅
+       - verification (scripts/verify_backfill.py): all pass incl.
+         settlement reality check (42 games: buzzer model prob
+         exactly 1.0 winner / 0.0 loser)                            ✅
+       - KNOWN DATA GAPS (collection, not pipeline): no Kalshi
+         trades 2026-04-28..05-01 (collector outage, 9 games) and
+         game 0042500201 CLE-DET G1 (subscription gap) → 50/60
+         games have trades; all 60 have PBP
+       - full-dataset info delay: avg 53s, p50 15s, p95 195s
+       - PERF DEBT: enrichment took ~6h for 5.85M records. Root
+         cause: operator pickles the whole AsOfJoiner per element
+         (O(n²) state serialization). Fix: granular ListState +
+         parallelism 4 + docker Flink cluster; golden parity test
+         is the safety net proving semantics unchanged             ⬜ TODO
+  2.2  Information delay analysis (receipt vs event view)           ⬜ TODO
+       (golden-game preview: avg 35s, p95 159s — worse than the
+        ~20s CDN poll assumption; material for the strategy)
+  2.3  Ray backtest engine + immutable results store                ⬜ TODO
+  2.4  First strategy backtest (analytical model, KXNBAGAME)        ⬜ TODO
+       (golden-game preview: naive model's "edge" vanishes at the
+        buzzer — needs team strength before it's tradeable)
 
-Phase 3 — Live stack
+Phase 3 — Live stack                                               ⬜ TODO
   3.1  OMS: state machine + SQLite log + startup reconciliation
   3.2  Risk engine: limits, circuit breaker, sequence-gap guard
   3.3  Strategy service: Kafka consumer + control-plane gRPC
-  3.4  Integration: replayer at 1x speed through full live stack,
-       golden game output identical to batch replay
+  3.4  Integration: replayer at 1x speed through full live stack
 
-Phase 4 — Hardening
+Phase 4 — Hardening                                                ⬜ TODO
   4.1  Full latency instrumentation (HDR histograms)
   4.2  Prometheus + Grafana
   4.3  Chaos suite: TaskManager kill, Redis kill, REST timeout injection
 ```
+
+### Known deviations / debts (revisit before Phase 3)
+
+- **D4 not yet implemented:** ticker→game_id mapping is a static JSON file
+  passed via `--game-map-file`, not a broadcast Kafka topic. Fine for batch
+  backfills; must become broadcast state before live (new markets mid-session).
+- **Flink checkpointing not enabled** in the dev job — acceptable for bounded
+  replays (rerun from scratch), required before live/unbounded mode.
+- **orderbook_delta is replayed but not consumed** — the join uses trades +
+  game state only. Book state enrichment (bid/ask at trade time) is future work.
+- **Environment:** single `.venv` (Python 3.11) holds pyflink + pm + everything.
+  Kafka connector jar in `jars/` (gitignored; fetch command in TESTING.md).
 
 ---
 

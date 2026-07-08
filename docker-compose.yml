@@ -24,6 +24,8 @@ services:
 
   clickhouse:
     image: clickhouse/clickhouse-server:24.8
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse   # survive `docker compose down`
     ports:
       - "8123:8123"   # HTTP interface (clickhouse-connect uses this)
       - "9000:9000"   # native protocol
@@ -42,5 +44,35 @@ services:
       timeout: 5s
       retries: 10
 
-# Flink cluster services (jobmanager + taskmanagers) are added when we move
-# off the local mini-cluster (DESIGN.md Deployment).
+  flink-jobmanager:
+    build: docker/flink
+    command: jobmanager
+    ports:
+      - "8081:8081"   # Flink Web UI
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+    volumes:
+      - .:/opt/pm                              # repo (code + jars + reference)
+      - flink-checkpoints:/flink-checkpoints   # shared with taskmanager
+    depends_on:
+      - kafka
+
+  flink-taskmanager:
+    build: docker/flink
+    command: taskmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        taskmanager.memory.process.size: 2560m
+    volumes:
+      - .:/opt/pm
+      - flink-checkpoints:/flink-checkpoints
+    depends_on:
+      - flink-jobmanager
+      - kafka
+
+volumes:
+  clickhouse-data:
+  flink-checkpoints:

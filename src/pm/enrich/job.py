@@ -45,7 +45,7 @@ from pyflink.datastream.connectors.kafka import (
     KafkaSource,
 )
 from pyflink.datastream.functions import KeyedCoProcessFunction, RuntimeContext
-from pyflink.datastream.state import ValueStateDescriptor
+from pyflink.datastream.state import ListStateDescriptor, ValueStateDescriptor
 
 from pm.core.dlq import Dlq, Ok
 from pm.enrich.join import AsOfJoiner, TaggedTrade
@@ -110,48 +110,87 @@ def classify_game_state(raw: str) -> tuple[str, Any]:
 
 
 class AsOfJoinOperator(KeyedCoProcessFunction):  # type: ignore[misc]
-    """Thin Flink shell around AsOfJoiner.
+    """Thin Flink shell around AsOfJoiner, with granular state.
 
-    Per key (game_id): the entire joiner (buffers + view states) is persisted
-    as one pickled ValueState. Every buffered record registers an event-time
-    timer at its receipt timestamp; when the watermark passes, on_timer
-    finalizes everything up to that point via advance_watermark.
+    State layout per key (game_id) — chosen so the per-element hot path never
+    reads or rewrites the buffer:
+
+        pending     ListState   buffered records; add() is append-only O(1)
+        views       ValueState  (receipt_view, event_view) — two small events
+        next_timer  ValueState  earliest registered event-time timer (ms)
+
+    Per element: one ListState.add() + (rarely) one timer registration.
+    Per timer fire: rehydrate a transient AsOfJoiner from the views, feed it
+    the pending records, advance to the current watermark, emit, and write
+    back the (much smaller) remainder + updated views. The join SEMANTICS
+    live entirely in AsOfJoiner — this class only persists and schedules.
+
+    (The previous design pickled the whole joiner — including every buffered
+    trade — into ValueState on every element: O(n^2) serialization that turned
+    the 5.85M-record backfill into a 6-hour run.)
 
     Timer/watermark domain is Kafka's millisecond timestamps; the joiner works
-    in nanoseconds. A timer firing at ms M means the watermark guarantees no
-    more records in ms-bucket <= M, i.e. nothing earlier than (M+1)*1e6 ns.
+    in nanoseconds. A watermark at ms W guarantees no more records in
+    ms-buckets <= W, i.e. nothing earlier than (W+1)*1e6 ns.
     """
 
     def __init__(self) -> None:
-        self._state: Any = None
+        self._pending: Any = None
+        self._views: Any = None
+        self._next_timer: Any = None
 
     def open(self, runtime_context: RuntimeContext) -> None:
-        self._state = runtime_context.get_state(
-            ValueStateDescriptor("joiner", Types.PICKLED_BYTE_ARRAY())
+        self._pending = runtime_context.get_list_state(
+            ListStateDescriptor("pending", Types.PICKLED_BYTE_ARRAY())
+        )
+        self._views = runtime_context.get_state(
+            ValueStateDescriptor("views", Types.PICKLED_BYTE_ARRAY())
+        )
+        self._next_timer = runtime_context.get_state(
+            ValueStateDescriptor("next_timer", Types.LONG())
         )
 
-    def _joiner(self) -> AsOfJoiner:
-        return self._state.value() or AsOfJoiner()
+    def _buffer(self, record: TaggedTrade | GameStateEvent, t_receipt_ns: int, ctx: Any) -> None:
+        self._pending.add(record)  # append-only; no read, no rewrite
+        ts_ms = t_receipt_ns // 1_000_000
+        nt = self._next_timer.value()
+        if nt is None or ts_ms < nt:
+            ctx.timer_service().register_event_time_timer(ts_ms)
+            self._next_timer.update(ts_ms)
 
     def process_element1(self, tagged: TaggedTrade, ctx: Any) -> None:  # trades
-        joiner = self._joiner()
-        joiner.on_trade(tagged)
-        self._state.update(joiner)
-        ctx.timer_service().register_event_time_timer(tagged.trade.t_receipt_ns // 1_000_000)
+        self._buffer(tagged, tagged.trade.t_receipt_ns, ctx)
 
     def process_element2(self, gs: GameStateEvent, ctx: Any) -> None:  # game states
-        joiner = self._joiner()
-        joiner.on_game_state(gs)
-        self._state.update(joiner)
-        ctx.timer_service().register_event_time_timer(gs.t_receipt_ns // 1_000_000)
+        self._buffer(gs, gs.t_receipt_ns, ctx)
 
     def on_timer(self, timestamp: int, ctx: Any) -> Generator[str, None, None]:
-        joiner = self._joiner()
-        watermark_ns = (timestamp + 1) * 1_000_000 - 1
-        enriched = joiner.advance_watermark(watermark_ns)
-        self._state.update(joiner)
-        for e in enriched:
+        watermark_ms = ctx.timer_service().current_watermark()
+        cutoff_ns = (watermark_ms + 1) * 1_000_000 - 1
+
+        receipt_view, event_view = self._views.value() or (None, None)
+        joiner = AsOfJoiner.restore(receipt_view, event_view)
+        for record in self._pending.get():
+            if isinstance(record, TaggedTrade):
+                joiner.on_trade(record)
+            else:
+                joiner.on_game_state(record)
+
+        for e in joiner.advance_watermark(cutoff_ns):
             yield e.model_dump_json()
+
+        remaining = joiner.pending
+        self._pending.update(remaining)  # rewrite only what's still unfinalized
+        self._views.update(joiner.views)
+        if remaining:
+            next_ms = min(
+                (r.trade.t_receipt_ns if isinstance(r, TaggedTrade) else r.t_receipt_ns)
+                for r in remaining
+            ) // 1_000_000
+            ctx.timer_service().register_event_time_timer(next_ms)
+            self._next_timer.update(next_ms)
+        else:
+            self._next_timer.clear()
 
 
 # ─── Job wiring ───────────────────────────────────────────────────────────────
@@ -197,14 +236,24 @@ def _kafka_sink(bootstrap: str, topic: str) -> KafkaSink:
     )
 
 
-def build_and_run(bootstrap: str, game_map: dict[str, str], bounded: bool = True) -> None:
+def build_and_run(
+    bootstrap: str,
+    game_map: dict[str, str],
+    bounded: bool = True,
+    parallelism: int = 1,
+    checkpoint_dir: str | None = None,
+) -> None:
     _ensure_output_topics(bootstrap)
 
     env = StreamExecutionEnvironment.get_execution_environment()
-    env.set_parallelism(1)  # single-process dev; raise with the docker cluster
-    # Python workers must use this venv's interpreter (pyflink + pm installed),
-    # not the system python:
+    env.set_parallelism(parallelism)
+    # Python workers must use this interpreter (pyflink + pm installed),
+    # not the system python. Same path must exist on all TaskManagers when
+    # running on a cluster (the docker image guarantees this).
     env.set_python_executable(sys.executable)
+    if checkpoint_dir:
+        env.enable_checkpointing(60_000)  # 60s, per DESIGN.md
+        env.get_checkpoint_config().set_checkpoint_storage_dir(checkpoint_dir)
     for jar in JARS_DIR.glob("*.jar"):
         env.add_jars(f"file://{jar}")
 
@@ -250,14 +299,31 @@ def main() -> None:
         help="JSON mapping of Kalshi event codes to NBA game_ids",
     )
     parser.add_argument(
+        "--game-map-file",
+        help="path to a JSON file with the event_code -> game_id mapping "
+        "(e.g. reference/game_map.json); overrides --game-map",
+    )
+    parser.add_argument(
         "--unbounded", action="store_true", help="keep consuming (live mode) instead of bounded"
+    )
+    parser.add_argument("--parallelism", type=int, default=1)
+    parser.add_argument(
+        "--checkpoint-dir",
+        help="enable 60s checkpointing to this URI (e.g. file:///flink-checkpoints; "
+        "path must exist on all TaskManagers)",
     )
     args = parser.parse_args()
 
     build_and_run(
         bootstrap=args.bootstrap_servers,
-        game_map=json.loads(args.game_map),
+        game_map=(
+            json.loads(Path(args.game_map_file).read_text())
+            if args.game_map_file
+            else json.loads(args.game_map)
+        ),
         bounded=not args.unbounded,
+        parallelism=args.parallelism,
+        checkpoint_dir=args.checkpoint_dir,
     )
 
 

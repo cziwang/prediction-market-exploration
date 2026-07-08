@@ -24,7 +24,7 @@ from pm.replay.sources import BronzeSource, LocalFileSource, S3FileSource
 
 GOLDEN_DIR = Path(__file__).parent.parent.parent.parent / "tests" / "fixtures" / "golden"
 BUCKET = "prediction-markets-data"
-S3_CHANNELS = ["trade", "orderbook_delta"]  # book snapshots not replayed yet
+DEFAULT_S3_CHANNELS = ["trade", "live_pbp"]  # book deltas not consumed by the join yet
 
 
 def golden_sources() -> list[BronzeSource]:
@@ -34,26 +34,40 @@ def golden_sources() -> list[BronzeSource]:
     ]
 
 
-def s3_sources(start: date, end: date) -> list[BronzeSource]:
+def s3_sources(start: date, end: date, channels: list[str]) -> list[BronzeSource]:
+    """One source per existing merged file. Missing dates are skipped (days
+    without games have no merged file), so existence is discovered by listing
+    rather than assumed by date arithmetic."""
     import boto3
 
     s3 = boto3.client("s3")
+    paginator = s3.get_paginator("list_objects_v2")
     sources: list[BronzeSource] = []
 
+    wanted_dates = set()
     d = start
     while d <= end:
-        for channel in S3_CHANNELS:
-            key = f"bronze_merged/kalshi_ws/{channel}/date={d.isoformat()}/merged.jsonl.gz"
-            sources.append(S3FileSource(BUCKET, key, channel, s3_client=s3))
+        wanted_dates.add(d.isoformat())
         d += timedelta(days=1)
 
-    # All PBP games (each file is one game; replayer merges by time, so games
-    # outside [start, end] simply interleave where their timestamps fall)
-    paginator = s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=BUCKET, Prefix="bronze_merged/nba_cdn/"):
-        for obj in page.get("Contents", []):
-            if obj["Key"].endswith(".jsonl.gz"):
-                sources.append(S3FileSource(BUCKET, obj["Key"], "live_pbp", s3_client=s3))
+    for channel in channels:
+        if channel == "live_pbp":
+            continue
+        prefix = f"bronze_merged/kalshi_ws/{channel}/"
+        for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]  # .../date=YYYY-MM-DD/merged.jsonl.gz
+                date_part = key.removeprefix(prefix).split("/")[0].removeprefix("date=")
+                if date_part in wanted_dates:
+                    sources.append(S3FileSource(BUCKET, key, channel, s3_client=s3))
+
+    if "live_pbp" in channels:
+        # All PBP games (each file is one game; the replayer merges by time,
+        # so games outside [start, end] interleave where their timestamps fall)
+        for page in paginator.paginate(Bucket=BUCKET, Prefix="bronze_merged/nba_cdn/"):
+            for obj in page.get("Contents", []):
+                if obj["Key"].endswith(".jsonl.gz"):
+                    sources.append(S3FileSource(BUCKET, obj["Key"], "live_pbp", s3_client=s3))
     return sources
 
 
@@ -67,6 +81,13 @@ def main() -> None:
     parser.add_argument(
         "--dry-run", action="store_true", help="read+merge+count without producing to Kafka"
     )
+    parser.add_argument(
+        "--channels",
+        nargs="+",
+        default=DEFAULT_S3_CHANNELS,
+        choices=["trade", "orderbook_delta", "live_pbp"],
+        help="channels to replay (s3 source only)",
+    )
     args = parser.parse_args()
 
     if args.source == "golden":
@@ -76,7 +97,7 @@ def main() -> None:
             parser.error("--source s3 requires --start")
         start = date.fromisoformat(args.start)
         end = date.fromisoformat(args.end) if args.end else start
-        sources = s3_sources(start, end)
+        sources = s3_sources(start, end, args.channels)
 
     producer: Producer
     if args.dry_run:

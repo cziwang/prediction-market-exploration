@@ -79,7 +79,12 @@ def merge_dates(start: date, end: date, out_dir: Path):
 
     print(f"\nGames found: {len(games)}")
     for game_id, actions in sorted(games.items()):
-        sorted_records = [actions[k] for k in sorted(actions)]
+        # Sort by RECEIPT time, not action_number: the CDN can deliver edits
+        # to earlier actions long after the fact (observed: a 94-minute-late
+        # correction), so action order != receipt order. The replayer and all
+        # receipt-view semantics require non-decreasing t_receipt within a
+        # file. action_number breaks ties within the same poll response.
+        sorted_records = sorted(actions.values(), key=lambda r: (r["t_receipt"], r["action_number"]))
         out_path = out_dir / f"nba_pbp_{game_id}.jsonl.gz"
         with gzip.open(out_path, "wt") as f:
             for rec in sorted_records:

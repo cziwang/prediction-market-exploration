@@ -75,6 +75,29 @@ class AsOfJoiner:
     # Event view: processed game state with max t_event_ns
     _event_state: GameStateEvent | None = None
 
+    @classmethod
+    def restore(
+        cls,
+        receipt_state: GameStateEvent | None,
+        event_state: GameStateEvent | None,
+    ) -> "AsOfJoiner":
+        """Rebuild a joiner from externally persisted view states (used by the
+        Flink operator, which stores views and pending records granularly)."""
+        joiner = cls()
+        joiner._receipt_state = receipt_state
+        joiner._event_state = event_state
+        return joiner
+
+    @property
+    def views(self) -> tuple[GameStateEvent | None, GameStateEvent | None]:
+        """(receipt_view, event_view) — for external persistence."""
+        return self._receipt_state, self._event_state
+
+    @property
+    def pending(self) -> list[TaggedTrade | GameStateEvent]:
+        """Buffered records not yet finalized, in buffer (timestamp) order."""
+        return [payload for _, _, _, payload in sorted(self._buffer)]  # type: ignore[misc]
+
     def on_game_state(self, gs: GameStateEvent) -> None:
         heapq.heappush(self._buffer, (gs.t_receipt_ns, _GAME_STATE_PRIORITY, self._seq, gs))
         self._seq += 1
