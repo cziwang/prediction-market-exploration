@@ -64,10 +64,7 @@ class BronzeSource(Protocol):
 
 
 def _extract_key(record: dict[str, Any], channel: Channel) -> str:
-    if channel == "live_pbp":
-        key = record["game_id"]
-    else:
-        key = record["frame"]["msg"]["market_ticker"]
+    key = record["game_id"] if channel == "live_pbp" else record["frame"]["msg"]["market_ticker"]
     if not isinstance(key, str) or not key:
         raise KeyError(f"empty or non-string key for channel {channel!r}")
     return key

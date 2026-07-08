@@ -91,7 +91,7 @@ class KafkaProducer:
         ]
         if to_create:
             futures = admin.create_topics(to_create)
-            for topic, future in futures.items():
+            for future in futures.values():
                 future.result(timeout=30)  # raises on failure
 
         self._producer = ConfluentProducer(
