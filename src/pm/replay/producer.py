@@ -102,7 +102,9 @@ class KafkaProducer:
                 # Throughput for full-speed replay:
                 "linger.ms": 50,
                 "batch.size": 1_000_000,
-                "compression.type": "zstd",
+                # lz4, not zstd: Flink's shaded Kafka connector doesn't bundle
+                # the zstd native lib, so zstd batches fail to decompress there
+                "compression.type": "lz4",
             }
         )
 
