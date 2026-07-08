@@ -681,11 +681,22 @@ Phase 2 — Research infrastructure                                  🔶 IN PRO
          game 0042500201 CLE-DET G1 (subscription gap) → 50/60
          games have trades; all 60 have PBP
        - full-dataset info delay: avg 53s, p50 15s, p95 195s
-       - PERF DEBT: enrichment took ~6h for 5.85M records. Root
-         cause: operator pickles the whole AsOfJoiner per element
-         (O(n²) state serialization). Fix: granular ListState +
-         parallelism 4 + docker Flink cluster; golden parity test
-         is the safety net proving semantics unchanged             ⬜ TODO
+       - PERF FIX LANDED: operator rewritten to granular state
+         (append-only ListState buffer + small ValueState views +
+         single next-timer pattern; AsOfJoiner.restore/views/
+         pending accessors). Golden parity reproduced ✅; golden
+         game wall time 65s → 8.8s. Job gained --parallelism and
+         --checkpoint-dir flags                                    ✅
+       - Dockerized Flink cluster (docker/flink/Dockerfile:
+         flink:1.20.2 + python3.10 + pyflink; repo mounted at
+         /opt/pm; JM+TM services, 4 slots, shared checkpoint
+         volume; submit via `make submit-enrich`, UI :8081)        ✅ built
+       - Deployed on EC2 t3.xlarge (i-0d970058962409dbf, 50GB;
+         account upgraded off free plan; access via SSH tunnel
+         -L 8081 -L 8123). Full stack healthy                      ✅
+       - PENDING: golden parity ON the cluster; timed full
+         backfill on cluster (expect ~15-30min vs 6h); sink to
+         EC2 ClickHouse + verify_backfill.py                       ⬜ TODO
   2.2  Information delay analysis (receipt vs event view)           ⬜ TODO
        (golden-game preview: avg 35s, p95 159s — worse than the
         ~20s CDN poll assumption; material for the strategy)

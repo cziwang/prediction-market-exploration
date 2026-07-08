@@ -463,11 +463,22 @@ trades. Missing: 9 games during a Kalshi-collector outage (2026-04-28 →
 (0042500201) whose markets the collector never subscribed to (games 2–3 of
 the same series are present). All 60 games have full PBP.
 
-**Performance finding:** the enrichment run took ~6 hours (~270 rec/s). Root
-cause: the operator re-pickles the entire AsOfJoiner — including every
-buffered trade — into ValueState on every element (O(n²) serialization).
-Fix planned: granular ListState buffer + docker Flink cluster at parallelism
-4; the golden parity test proves the optimization preserves semantics.
+**Performance finding (FIXED):** the first full enrichment run took ~6 hours
+(~270 rec/s). Root cause: the operator re-pickled the entire AsOfJoiner —
+including every buffered trade — into ValueState on every element (O(n²)
+serialization). Fixed with granular state (append-only ListState buffer,
+small ValueState views, single next-timer per key); golden parity reproduced
+byte-for-byte, golden-game wall time 65s → 8.8s. War story #7 in spirit:
+*whole-object ValueState is the classic Flink Python anti-pattern; per-element
+cost must be O(element), never O(state).*
+
+**Cluster mode:** jobs can now run on the dockerized Flink cluster
+(`docker compose up -d` brings up jobmanager + taskmanager with 4 slots;
+`make submit-enrich` submits from inside the network at parallelism 4 with
+60s checkpointing; Web UI at :8081). On EC2, tunnel with
+`ssh -L 8081:localhost:8081 -L 8123:localhost:8123 ubuntu@<IP>`.
+Cluster-vs-mini-cluster parity on the golden game is the pending acceptance
+test, then a timed full backfill.
 
 ## Where to go next
 
