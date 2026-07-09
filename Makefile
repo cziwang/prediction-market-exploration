@@ -20,7 +20,7 @@ PIP    := $(VENV)/bin/pip
 CONNECTOR_JAR := jars/flink-sql-connector-kafka-3.4.0-1.20.jar
 CONNECTOR_URL := https://repo1.maven.org/maven2/org/apache/flink/flink-sql-connector-kafka/3.4.0-1.20/flink-sql-connector-kafka-3.4.0-1.20.jar
 
-.PHONY: all install jars up down submit-enrich test lint typecheck clean \
+.PHONY: all install jars up down wipe-topics submit-enrich test lint typecheck clean \
         ec2-start ec2-ip ec2-ssh ec2-bootstrap ec2-setup
 
 all: install jars
@@ -52,6 +52,18 @@ up:
 
 down:
 	docker compose down
+
+# Delete all pipeline topics and wait for async deletion to complete.
+# Kafka topic deletion is asynchronous — if you skip the wait, the next
+# replay races the deletion and you get partial data (war story #4).
+TOPICS := kalshi.trades kalshi.book_update nba.game_state reference.markets enriched.trades dlq.enrich
+
+wipe-topics:
+	@for t in $(TOPICS); do \
+	  docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+	    --bootstrap-server localhost:9092 --delete --topic $$t 2>/dev/null || true; \
+	done
+	@$(VENV)/bin/python scripts/wait_topics_deleted.py $(TOPICS)
 
 # ── Flink cluster job submission ─────────────────────────────────────────
 # Submits from INSIDE the compose network (kafka:29092; repo mounted at
