@@ -25,4 +25,10 @@ RUN pip3 install --no-cache-dir \
     "clickhouse-connect>=0.7" \
     "boto3>=1.34"
 
+# Pre-create the checkpoint dir owned by the flink user: Docker initializes
+# a NEW named volume with the ownership of the image path it mounts over.
+# Without this the volume is root-owned and the JobManager's checkpoint
+# coordinator fails with "Failed to create directory for shared state".
+RUN mkdir -p /flink-checkpoints && chown flink:flink /flink-checkpoints
+
 ENV PYTHONPATH=/opt/pm/src

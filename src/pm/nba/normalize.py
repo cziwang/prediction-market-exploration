@@ -43,7 +43,15 @@ def _seconds_remaining(period: int, clock_seconds: float) -> float:
 
 def _iso_to_ns(iso: str) -> int:
     # frame.timeActual: "2026-04-18T22:54:14.2Z"
-    dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    # Python 3.10's fromisoformat rejects fractional seconds with != 3 or 6
+    # digits (e.g. ".6" or ".60"). Pad to 6 digits for cross-version safety.
+    s = iso.replace("Z", "+00:00")
+    dot = s.find(".")
+    if dot != -1:
+        plus = s.index("+", dot)
+        frac = s[dot + 1 : plus]
+        s = s[: dot + 1] + frac.ljust(6, "0") + s[plus:]
+    dt = datetime.fromisoformat(s)
     return int(dt.timestamp() * 1_000_000_000)
 
 
