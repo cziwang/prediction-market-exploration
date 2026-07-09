@@ -20,8 +20,8 @@ PIP    := $(VENV)/bin/pip
 CONNECTOR_JAR := jars/flink-sql-connector-kafka-3.4.0-1.20.jar
 CONNECTOR_URL := https://repo1.maven.org/maven2/org/apache/flink/flink-sql-connector-kafka/3.4.0-1.20/flink-sql-connector-kafka-3.4.0-1.20.jar
 
-.PHONY: all install jars up down wipe-topics submit-enrich test lint typecheck clean \
-        ec2-start ec2-ip ec2-ssh ec2-bootstrap ec2-setup
+.PHONY: all install jars up down wipe-topics check-dlq submit-enrich test lint typecheck clean \
+        ec2-start ec2-ip ec2-ssh ec2-tunnel ec2-bootstrap ec2-setup
 
 all: install jars
 
@@ -64,6 +64,9 @@ wipe-topics:
 	    --bootstrap-server localhost:9092 --delete --topic $$t 2>/dev/null || true; \
 	done
 	@$(VENV)/bin/python scripts/wait_topics_deleted.py $(TOPICS)
+
+check-dlq:
+	$(VENV)/bin/python scripts/inspect_dlq.py
 
 # ── Flink cluster job submission ─────────────────────────────────────────
 # Submits from INSIDE the compose network (kafka:29092; repo mounted at
@@ -114,6 +117,11 @@ ec2-ip:
 ec2-ssh:
 	@test -n "$(EC2_IP)" || { echo "error: instance has no public IP (is it running?)"; exit 1; }
 	$(EC2_SSH)
+
+# SSH with port forwarding for Flink UI (:8081) and ClickHouse (:8123)
+ec2-tunnel:
+	@test -n "$(EC2_IP)" || { echo "error: instance has no public IP (is it running?)"; exit 1; }
+	ssh -i $(EC2_KEY) -L 8081:localhost:8081 -L 8123:localhost:8123 ubuntu@$(EC2_IP)
 
 # Copies the bootstrap script to EC2 and runs it.
 # Safe to re-run after a docker group change (second run skips already-done steps).
