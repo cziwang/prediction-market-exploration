@@ -426,6 +426,17 @@ compatibility is a producer-side decision.*
 | Parity fails right after topic deletion | Async deletion race (war story #4) | Use the wait loop; never skip step 2 |
 | ClickHouse row count doubled | Dedup token ignored | Check table has `non_replicated_deduplication_window` setting; batches must be offset-aligned |
 | `SourceError` reading a bronze file | Genuinely malformed/misordered bronze | Investigate the file at the reported line — do not "fix" by skipping |
+| `NoResourceAvailableException` on cluster | TaskManager OOM (flat-out replay buffers large batches) | Increase `taskmanager.memory.process.size` in docker-compose.yml |
+| `ValueError: Invalid isoformat string` in DLQ | Python 3.10 rejects fractional seconds with !=3/6 digits | Fixed: `_iso_to_ns` pads to 6 digits |
+
+**Diagnostic commands:**
+
+```
+make check-topics     # message counts for all pipeline topics
+make check-dlq        # DLQ count + first 5 records with errors
+make wipe-topics      # delete all topics + wait for async deletion
+make ec2-tunnel       # SSH with Flink UI + ClickHouse port forwarding
+```
 
 ---
 
@@ -477,8 +488,17 @@ cost must be O(element), never O(state).*
 `make submit-enrich` submits from inside the network at parallelism 4 with
 60s checkpointing; Web UI at :8081). On EC2, tunnel with
 `ssh -L 8081:localhost:8081 -L 8123:localhost:8123 ubuntu@<IP>`.
-Cluster-vs-mini-cluster parity on the golden game is the pending acceptance
-test, then a timed full backfill.
+Cluster-vs-mini-cluster parity on the golden game: **PASS** (all 9 anchor
+checks + byte-for-byte fixture match at parallelism 4). Found a Python
+3.10 fromisoformat bug (variable fractional-second digits rejected by 3.10
+but accepted by 3.11) — all 548 game-state records were DLQ'd; fix: pad
+fractional seconds to 6 digits. War story #8 in spirit: *always test on
+the actual runtime version; the DLQ is your safety net.*
+
+Full backfill on the EC2 cluster: 5,851,077 enriched trades, 0 DLQ,
+verify_backfill.py all green. TaskManager memory was bumped from 2.5GB to
+6GB — flat-out replay compresses 553h of event time into ~2 min, so
+ListState buffers accumulate large batches between watermark advances.
 
 ## Where to go next
 

@@ -694,9 +694,17 @@ Phase 2 — Research infrastructure                                  🔶 IN PRO
        - Deployed on EC2 t3.xlarge (i-0d970058962409dbf, 50GB;
          account upgraded off free plan; access via SSH tunnel
          -L 8081 -L 8123). Full stack healthy                      ✅
-       - PENDING: golden parity ON the cluster; timed full
-         backfill on cluster (expect ~15-30min vs 6h); sink to
-         EC2 ClickHouse + verify_backfill.py                       ⬜ TODO
+       - Golden parity ON the cluster: PASS (all 9 anchors +
+         byte-for-byte fixture match at parallelism 4).
+         Found + fixed Python 3.10 fromisoformat bug (variable
+         fractional-second digits; DLQ caught all 548 records)     ✅
+       - Timed full backfill on EC2 cluster: 5,851,077 enriched
+         trades, 0 DLQ, 0 duplicates, verify_backfill.py all
+         green. TaskManager memory bumped 2.5→6GB (flat-out
+         replay buffers large batches between watermark advances)  ✅
+       - Cluster sink to ClickHouse verified (ch-sink-cluster
+         group; settlement reality check passes, 42 games with
+         post-buzzer trades, same 50/60 game coverage)             ✅
   2.2  Information delay analysis (receipt vs event view)           ⬜ TODO
        (golden-game preview: avg 35s, p95 159s — worse than the
         ~20s CDN poll assumption; material for the strategy)
@@ -724,6 +732,13 @@ Phase 4 — Hardening                                                ⬜ TODO
   backfills; must become broadcast state before live (new markets mid-session).
 - **Flink checkpointing not enabled** in the dev job — acceptable for bounded
   replays (rerun from scratch), required before live/unbounded mode.
+- **enriched.trades has no Kafka key** — the KafkaSink writes null keys
+  (round-robin partitioning), so per-game ordering is not guaranteed across
+  partitions. Fine for batch (ClickHouse sorts at query time), but a live
+  strategy consumer needs per-game ordering. Fix: a small custom Java
+  `KafkaRecordSerializationSchema` that extracts game_id as key from a Row
+  element (PyFlink's builder passes the same element to both key and value
+  serializers, so pure-Python can't separate them).
 - **orderbook_delta is replayed but not consumed** — the join uses trades +
   game state only. Book state enrichment (bid/ask at trade time) is future work.
 - **Environment:** single `.venv` (Python 3.11) holds pyflink + pm + everything.
