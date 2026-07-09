@@ -65,7 +65,7 @@ services:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
         taskmanager.numberOfTaskSlots: 4
-        taskmanager.memory.process.size: 2560m
+        taskmanager.memory.process.size: 6144m
     volumes:
       - .:/opt/pm
       - flink-checkpoints:/flink-checkpoints
